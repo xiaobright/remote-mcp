@@ -1,43 +1,11 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setTimeout as delay } from "node:timers/promises";
-function readPositiveIntEnv(name, fallback) {
-    const raw = process.env[name]?.trim();
-    if (!raw) {
-        return fallback;
-    }
-    const value = Number.parseInt(raw, 10);
-    return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-function readStringArrayJsonEnv(name) {
-    const raw = process.env[name]?.trim();
-    if (!raw) {
-        return null;
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) {
-        throw new Error(`${name} must be a JSON string array`);
-    }
-    return parsed;
-}
-function sshSpawnOptions() {
-    const home = homedir();
-    return {
-        env: {
-            ...process.env,
-            HOME: process.env.HOME || home,
-            USERPROFILE: process.env.USERPROFILE || home,
-            ProgramData: process.env.ProgramData || "C:\\ProgramData",
-            SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows",
-            WINDIR: process.env.WINDIR || process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows",
-        },
-        windowsHide: true,
-    };
-}
+import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv, readStringArrayJsonEnv } from "@remote-mcp/shared/env";
+import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
+import { buildEnvPreamble, buildWorkdirPreamble, validateShell, } from "@remote-mcp/shared/shell";
+import { ProcessTaskManager, } from "@remote-mcp/shared/task-manager";
 const SSH_COMMAND = process.env.SSH_MCP_COMMAND?.trim() || "ssh";
 const INITIAL_DEFAULT_TARGET = process.env.SSH_MCP_DEFAULT_TARGET?.trim() || null;
 const DEFAULT_SHELL = process.env.SSH_MCP_DEFAULT_SHELL?.trim() || "bash";
@@ -77,37 +45,19 @@ function buildDefaultSshOptions() {
 }
 const DEFAULT_SSH_OPTIONS = buildDefaultSshOptions();
 let currentDefaultTarget = INITIAL_DEFAULT_TARGET;
-const tasks = new Map();
+const taskManager = new ProcessTaskManager({
+    outputLimit: TASK_OUTPUT_LIMIT,
+    maxFinishedTasks: MAX_FINISHED_TASKS,
+    minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
+    pollRecommendation: "Use ssh_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
+    unknownTaskLabel: "SSH",
+});
 let deviceStoreCache = null;
 function nowIso() {
     return new Date().toISOString();
 }
-function isPositiveInt(value) {
-    return typeof value === "number" && Number.isInteger(value) && value > 0;
-}
 function boundedDuration(requestedMs, fallbackMs) {
-    const requested = isPositiveInt(requestedMs) ? requestedMs : undefined;
-    const fallback = Math.min(fallbackMs, MAX_TOOL_TIMEOUT_MS);
-    const ms = Math.min(requested ?? fallback, MAX_TOOL_TIMEOUT_MS);
-    return {
-        ms,
-        requestedMs: requested,
-        clamped: typeof requested === "number" && requested > ms,
-        maxMs: MAX_TOOL_TIMEOUT_MS,
-    };
-}
-function shellQuote(value) {
-    return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-function validateShell(shell) {
-    const trimmed = shell.trim();
-    if (!trimmed) {
-        throw new Error("shell cannot be empty");
-    }
-    if (!/^[A-Za-z0-9_./+-]+$/.test(trimmed)) {
-        throw new Error(`Unsafe shell value: ${shell}`);
-    }
-    return trimmed;
+    return sharedBoundedDuration(requestedMs, fallbackMs, MAX_TOOL_TIMEOUT_MS);
 }
 function validateDeviceName(name) {
     const trimmed = name.trim();
@@ -292,21 +242,8 @@ function remoteShellArgs(shellInput, login = true) {
     }
     return [shell, "-s"];
 }
-function validateEnvName(name) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-        throw new Error(`Unsafe environment variable name: ${name}`);
-    }
-    return name;
-}
 function buildPreamble(workdir, env) {
-    const lines = [];
-    for (const [name, value] of Object.entries(env ?? {})) {
-        lines.push(`export ${validateEnvName(name)}=${shellQuote(String(value))}`);
-    }
-    if (workdir) {
-        lines.push(`cd -- ${shellQuote(workdir)}`);
-    }
-    return lines.length ? `${lines.join("\n")}\n` : "";
+    return buildEnvPreamble(env) + buildWorkdirPreamble(workdir);
 }
 function buildScriptInput(script, workdir, env) {
     return buildPreamble(workdir, env) + script + (script.endsWith("\n") ? "" : "\n");
@@ -356,7 +293,7 @@ function buildSshArgs(options) {
 async function probeCandidateTarget(options, resolved) {
     const args = buildSshArgsForTarget(options, resolved);
     return new Promise((resolveProbe) => {
-        const proc = spawn(SSH_COMMAND, args, sshSpawnOptions());
+        const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
         let stderr = "";
         let settled = false;
         const timer = setTimeout(() => {
@@ -415,7 +352,7 @@ async function buildSshArgsForRun(options) {
     throw new Error(`Could not connect to any SSH target candidate for ${candidates[0].requestedTarget}. ${details}`);
 }
 export function getSshState() {
-    const taskList = [...tasks.values()];
+    const taskList = taskManager.list();
     const store = readDeviceStore();
     return {
         sshCommand: SSH_COMMAND,
@@ -502,7 +439,7 @@ export async function runSshScript(options) {
     const input = buildScriptInput(options.script, effectiveWorkdir, options.env);
     const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
     return new Promise((resolve, reject) => {
-        const proc = spawn(SSH_COMMAND, args, sshSpawnOptions());
+        const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
         let stdout = "";
         let stderr = "";
         let timedOut = false;
@@ -555,234 +492,45 @@ export async function runSshScript(options) {
         proc.stdin?.end();
     });
 }
-function appendTaskOutput(task, stream, data) {
-    const text = data.toString();
-    const baseKey = stream === "stdout" ? "stdoutBaseOffset" : "stderrBaseOffset";
-    task[stream] += text;
-    const overflow = task[stream].length - TASK_OUTPUT_LIMIT;
-    if (overflow > 0) {
-        task[stream] = task[stream].slice(overflow);
-        task[baseKey] += overflow;
-    }
-}
-function makeFinishedLatch() {
-    let resolveFinished;
-    const finished = new Promise((resolve) => {
-        resolveFinished = resolve;
-    });
-    return { finished, resolveFinished };
-}
-function taskSnapshot(task) {
-    return {
-        taskId: task.taskId,
-        state: task.state,
-        target: task.target,
-        requestedTarget: task.requestedTarget,
-        deviceName: task.deviceName,
-        command: task.command,
-        shell: task.shell,
-        workdir: task.workdir,
-        pid: task.pid,
-        startedAt: task.startedAt,
-        endedAt: task.endedAt,
-        exitCode: task.exitCode,
-        signal: task.signal,
-        error: task.error,
-        stdoutLength: task.stdoutBaseOffset + task.stdout.length,
-        stderrLength: task.stderrBaseOffset + task.stderr.length,
-        stdoutTruncated: task.stdoutBaseOffset > 0,
-        stderrTruncated: task.stderrBaseOffset > 0,
-    };
-}
-function pruneFinishedTasks() {
-    if (MAX_FINISHED_TASKS <= 0) {
-        return;
-    }
-    const finished = [...tasks.values()].filter((task) => task.state !== "running");
-    const extra = finished.length - MAX_FINISHED_TASKS;
-    if (extra <= 0) {
-        return;
-    }
-    finished
-        .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-        .slice(0, extra)
-        .forEach((task) => tasks.delete(task.taskId));
-}
-function sliceTaskStream(content, baseOffset, requestedOffset, tailChars) {
-    const totalLength = baseOffset + content.length;
-    const offset = typeof tailChars === "number"
-        ? Math.max(baseOffset, totalLength - tailChars)
-        : Math.max(baseOffset, requestedOffset ?? baseOffset);
-    const start = offset - baseOffset;
-    return {
-        text: content.slice(start),
-        offset,
-        nextOffset: totalLength,
-        truncated: (requestedOffset ?? offset) < baseOffset,
-    };
-}
-function getTask(taskId) {
-    const task = tasks.get(taskId);
-    if (!task) {
-        throw new Error(`Unknown SSH task: ${taskId}`);
-    }
-    return task;
-}
-function readTaskOutputUnlocked(task, stdoutOffset, stderrOffset, tailChars) {
-    const stdout = sliceTaskStream(task.stdout, task.stdoutBaseOffset, stdoutOffset, tailChars);
-    const stderr = sliceTaskStream(task.stderr, task.stderrBaseOffset, stderrOffset, tailChars);
-    return {
-        task: taskSnapshot(task),
-        stdout: stdout.text,
-        stderr: stderr.text,
-        stdoutOffset: stdout.offset,
-        stderrOffset: stderr.offset,
-        nextStdoutOffset: stdout.nextOffset,
-        nextStderrOffset: stderr.nextOffset,
-        stdoutTruncated: stdout.truncated,
-        stderrTruncated: stderr.truncated,
-    };
-}
-async function withTaskObservationThrottle(task, fn) {
-    const previous = task.observationLock;
-    let release;
-    task.observationLock = new Promise((resolve) => {
-        release = resolve;
-    });
-    await previous;
-    try {
-        const now = Date.now();
-        const elapsed = task.lastObservationAt === null ? TASK_MIN_POLL_INTERVAL_MS : now - task.lastObservationAt;
-        const waitMs = task.state === "running" ? Math.max(0, TASK_MIN_POLL_INTERVAL_MS - elapsed) : 0;
-        if (waitMs > 0) {
-            await delay(waitMs);
-        }
-        task.lastObservationAt = Date.now();
-        const poll = {
-            throttled: waitMs > 0,
-            waitedMs: waitMs,
-            minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
-            recommendedAction: "Use ssh_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
-        };
-        return await fn(poll);
-    }
-    finally {
-        release();
-    }
-}
-async function waitForTaskEnd(task, waitMs) {
-    if (task.state !== "running") {
-        return true;
-    }
-    let timer = null;
-    const timeout = new Promise((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), waitMs);
-        timer.unref();
-    });
-    const result = await Promise.race([
-        task.finished.then(() => "finished"),
-        timeout,
-    ]);
-    if (timer) {
-        clearTimeout(timer);
-    }
-    return result === "finished" || task.state !== "running";
-}
 export async function startSshTask(options) {
     const { resolved, args } = await buildSshArgsForRun(options);
     const effectiveWorkdir = options.workdir ?? resolved.profile?.defaultWorkdir;
     const input = buildScriptInput(options.script, effectiveWorkdir, options.env);
-    const proc = spawn(SSH_COMMAND, args, sshSpawnOptions());
-    const latch = makeFinishedLatch();
-    const taskId = randomUUID();
+    const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
     const shell = validateShell(options.shell || DEFAULT_SHELL);
-    const task = {
-        taskId,
-        state: "running",
+    return taskManager.start(proc, {
         target: resolved.target,
         requestedTarget: resolved.requestedTarget,
         deviceName: resolved.deviceName,
         command: options.script,
         shell,
         workdir: effectiveWorkdir,
-        proc,
-        pid: proc.pid ?? null,
-        startedAt: nowIso(),
-        endedAt: null,
-        exitCode: null,
-        signal: null,
-        error: null,
-        stdout: "",
-        stderr: "",
-        stdoutBaseOffset: 0,
-        stderrBaseOffset: 0,
-        finished: latch.finished,
-        resolveFinished: latch.resolveFinished,
-        lastObservationAt: null,
-        observationLock: Promise.resolve(),
-    };
-    tasks.set(taskId, task);
-    proc.stdout?.on("data", (data) => appendTaskOutput(task, "stdout", data));
-    proc.stderr?.on("data", (data) => appendTaskOutput(task, "stderr", data));
-    proc.on("close", (code, signal) => {
-        if (task.state !== "cancelled") {
-            task.state = "exited";
-        }
-        task.exitCode = code ?? -1;
-        task.signal = signal;
-        task.endedAt ??= nowIso();
-        task.proc = null;
-        task.pid = null;
-        task.resolveFinished();
-        if ((code ?? -1) === 0 && resolved.profile) {
-            rememberResolvedDevice(resolved.profile, resolved.target);
-        }
-        pruneFinishedTasks();
+    }, {
+        input,
+        onSuccessfulExit: () => {
+            if (resolved.profile) {
+                rememberResolvedDevice(resolved.profile, resolved.target);
+            }
+        },
     });
-    proc.on("error", (error) => {
-        task.state = "error";
-        task.error = error.message;
-        task.endedAt ??= nowIso();
-        task.proc = null;
-        task.pid = null;
-        task.resolveFinished();
-        pruneFinishedTasks();
-    });
-    proc.stdin?.write(input);
-    proc.stdin?.end();
-    return taskSnapshot(task);
 }
 export function listTasks() {
-    return [...tasks.values()].map(taskSnapshot);
+    return taskManager.list();
 }
 export async function observeTaskStatus(taskId) {
-    const task = getTask(taskId);
-    return withTaskObservationThrottle(task, (poll) => ({
-        ...taskSnapshot(task),
-        poll,
-    }));
+    return taskManager.observeStatus(taskId);
 }
 export async function observeTaskOutput(taskId, stdoutOffset, stderrOffset, tailChars) {
-    const task = getTask(taskId);
-    return withTaskObservationThrottle(task, (poll) => ({
-        ...readTaskOutputUnlocked(task, stdoutOffset, stderrOffset, tailChars),
-        poll,
-    }));
+    return taskManager.observeOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
 }
 export function readTaskOutput(taskId, stdoutOffset, stderrOffset, tailChars) {
-    return readTaskOutputUnlocked(getTask(taskId), stdoutOffset, stderrOffset, tailChars);
+    return taskManager.readOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
 }
 export async function waitTask(taskId, waitMs = DEFAULT_TASK_WAIT_MS, options = {}) {
-    const task = getTask(taskId);
     const wait = boundedDuration(waitMs, DEFAULT_TASK_WAIT_MS);
-    const started = Date.now();
-    const completed = await waitForTaskEnd(task, wait.ms);
-    const waitedMs = Date.now() - started;
+    const output = await taskManager.wait(taskId, wait.ms, options);
     return {
-        ...readTaskOutputUnlocked(task, options.stdoutOffset, options.stderrOffset, options.tailChars),
-        completed,
-        timedOut: !completed,
-        waitedMs,
+        ...output,
         waitMs: wait.ms,
         requestedWaitMs: wait.requestedMs,
         waitClamped: wait.clamped,
@@ -816,24 +564,10 @@ export async function watchSshTask(options, timeoutMs = DEFAULT_WATCH_TIMEOUT_MS
     };
 }
 export function cancelTask(taskId) {
-    const task = getTask(taskId);
-    if (task.state === "running" && task.proc) {
-        task.state = "cancelled";
-        task.endedAt = nowIso();
-        task.proc.kill();
-        task.resolveFinished();
-    }
-    return taskSnapshot(task);
+    return taskManager.cancel(taskId);
 }
 export function cancelAllTasksSync() {
-    for (const task of tasks.values()) {
-        if (task.state === "running" && task.proc) {
-            task.state = "cancelled";
-            task.endedAt = nowIso();
-            task.proc.kill();
-            task.resolveFinished();
-        }
-    }
+    taskManager.cancelAllSync();
 }
 export async function testSshTarget(target, timeoutMs = 15000) {
     const candidates = candidateTargetsFor(target);

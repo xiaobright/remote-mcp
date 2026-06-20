@@ -5,6 +5,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
+  asRecord,
+  errorResponse,
+  optionalBoolean,
+  optionalNumber,
+  optionalString,
+  optionalStringArray,
+  optionalStringRecord,
+  taskTailChars,
+} from "@remote-mcp/shared/mcp";
+import {
   cancelAllTasksSync,
   cancelTask,
   candidateTargetsFor,
@@ -34,11 +44,6 @@ const server = new McpServer({
 
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
-
-function errorResponse(error: unknown) {
-  const msg = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
 
 function formatCommandResult(result: {
   target?: string;
@@ -88,49 +93,12 @@ function formatTaskOutput(output: {
   ].filter(Boolean).join("");
 }
 
-function optionalString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-function optionalNumber(value: unknown): number | undefined {
-  return typeof value === "number" ? value : undefined;
-}
-
-function optionalBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function optionalStringArray(value: unknown): string[] | undefined {
-  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
-}
-
-function optionalStringRecord(value: unknown): Record<string, string> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-
-  const record = value as Record<string, unknown>;
-  return Object.values(record).every((item) => typeof item === "string")
-    ? record as Record<string, string>
-    : undefined;
-}
-
 function optionalRunMode(value: unknown): SshRunMode | undefined {
   return value === "sync" || value === "async" || value === "watch" ? value : undefined;
 }
 
 function optionalTimeoutBehavior(value: unknown): SshTimeoutBehavior | undefined {
   return value === "kill" || value === "detach" ? value : undefined;
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" ? value as Record<string, unknown> : {};
-}
-
-function taskTailChars(params: { tail_chars?: number; tailChars?: number }): number | undefined;
-function taskTailChars(params: Record<string, unknown>): number | undefined;
-function taskTailChars(params: { tail_chars?: number; tailChars?: number } | Record<string, unknown>): number | undefined {
-  return optionalNumber(params.tail_chars) ?? optionalNumber(params.tailChars);
 }
 
 async function handleProfileAction(params: {

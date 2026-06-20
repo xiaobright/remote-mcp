@@ -1,0 +1,42 @@
+{
+  "name": "@remote-mcp/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./env": {
+      "types": "./dist/env.d.ts",
+      "default": "./dist/env.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "default": "./dist/mcp.js"
+    },
+    "./process": {
+      "types": "./dist/process.d.ts",
+      "default": "./dist/process.js"
+    },
+    "./remote": {
+      "types": "./dist/remote/index.d.ts",
+      "default": "./dist/remote/index.js"
+    },
+    "./shell": {
+      "types": "./dist/shell.d.ts",
+      "default": "./dist/shell.js"
+    },
+    "./task-manager": {
+      "types": "./dist/taskManager.d.ts",
+      "default": "./dist/taskManager.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts"
+  }
+}

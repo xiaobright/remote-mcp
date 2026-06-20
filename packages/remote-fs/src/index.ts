@@ -3,17 +3,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { applyUpdatePatch, parsePatch, textForAddedFile } from "./patch.js";
 import {
+  applyUpdatePatch,
+  joinRemotePath,
   listDir,
+  parsePatch,
   readTextFile,
   searchText,
   sha256Text,
   statPath,
+  textForAddedFile,
   writeTextFile,
-} from "./remoteOps.js";
-import { joinRemotePath } from "./shell.js";
-import { type RemoteTarget } from "./transport.js";
+  type RemoteTarget,
+} from "@remote-mcp/shared/remote";
+import { errorResponse } from "@remote-mcp/shared/mcp";
 
 const server = new McpServer({
   name: "remote-fs-mcp-server",
@@ -42,11 +45,6 @@ const targetFields = {
     .optional()
     .describe("Optional remote root joined with relative paths before execution."),
 };
-
-function errorResponse(error: unknown) {
-  const msg = error instanceof Error ? error.message : String(error);
-  return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
-}
 
 function targetFrom(params: {
   transport: "wsl" | "ssh";

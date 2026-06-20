@@ -8,9 +8,15 @@ which ones to load:
 - `@remote-mcp/ssh`: SSH command/script/task/profile MCP.
 - `@remote-mcp/wsl`: WSL command/script/task/session MCP.
 - `@remote-mcp/remote-fs`: remote file operations over SSH or WSL.
+- `@remote-mcp/shared`: internal shared code for process spawning, MCP helpers,
+  async task management, shell quoting, patch parsing, and remote file ops.
 
 `remote-fs` keeps patch parsing and safety checks local, then uses small POSIX
 shell snippets on the remote side for reads, writes, listings, stats, and search.
+
+The public MCP servers remain independent entrypoints. The shared package is not
+loaded by clients directly; it keeps behavior consistent across the separate
+servers while allowing each server to be enabled or disabled on its own.
 
 ## Tools
 

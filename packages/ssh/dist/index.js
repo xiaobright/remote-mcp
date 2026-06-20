@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { asRecord, errorResponse, optionalBoolean, optionalNumber, optionalString, optionalStringArray, optionalStringRecord, taskTailChars, } from "@remote-mcp/shared/mcp";
 import { cancelAllTasksSync, cancelTask, candidateTargetsFor, getDevice, getSshState, listDevices, listTasks, observeTaskOutput, observeTaskStatus, removeDevice, runSshScript, setDefaultTarget, startSshTask, testSshTarget, upsertDevice, waitTask, watchSshTask, } from "./ssh.js";
 const server = new McpServer({
     name: "ssh-mcp-server",
@@ -10,10 +11,6 @@ const server = new McpServer({
 });
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
-function errorResponse(error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
-}
 function formatCommandResult(result) {
     return [
         result.target ? `Target: ${result.target}\n` : "",
@@ -43,38 +40,11 @@ function formatTaskOutput(output) {
         poll?.throttled ? `\nPolling was throttled inside the MCP server; waited ${poll.waitedMs} ms before returning.` : "",
     ].filter(Boolean).join("");
 }
-function optionalString(value) {
-    return typeof value === "string" ? value : undefined;
-}
-function optionalNumber(value) {
-    return typeof value === "number" ? value : undefined;
-}
-function optionalBoolean(value) {
-    return typeof value === "boolean" ? value : undefined;
-}
-function optionalStringArray(value) {
-    return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
-}
-function optionalStringRecord(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-        return undefined;
-    }
-    const record = value;
-    return Object.values(record).every((item) => typeof item === "string")
-        ? record
-        : undefined;
-}
 function optionalRunMode(value) {
     return value === "sync" || value === "async" || value === "watch" ? value : undefined;
 }
 function optionalTimeoutBehavior(value) {
     return value === "kill" || value === "detach" ? value : undefined;
-}
-function asRecord(value) {
-    return value && typeof value === "object" ? value : {};
-}
-function taskTailChars(params) {
-    return optionalNumber(params.tail_chars) ?? optionalNumber(params.tailChars);
 }
 async function handleProfileAction(params) {
     switch (params.action) {

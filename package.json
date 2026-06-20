@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
+    "build": "npm --workspace @remote-mcp/shared run build && npm --workspace @remote-mcp/ssh run build && npm --workspace @remote-mcp/wsl run build && npm --workspace @remote-mcp/remote-fs run build",
     "start:ssh": "npm --workspace @remote-mcp/ssh start",
     "start:wsl": "npm --workspace @remote-mcp/wsl start",
     "start:remote-fs": "npm --workspace @remote-mcp/remote-fs start"

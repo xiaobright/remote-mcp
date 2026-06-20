@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { asRecord, errorResponse, optionalNumber, optionalString, taskTailChars, } from "@remote-mcp/shared/mcp";
 import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, } from "./wsl.js";
 const server = new McpServer({
     name: "wsl-mcp-server",
@@ -13,10 +14,6 @@ function formatDistro(distro) {
 }
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
-function errorResponse(error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    return { content: [{ type: "text", text: `Error: ${msg}` }] };
-}
 function formatCommandResult(result) {
     return [
         result.stdout,
@@ -211,23 +208,11 @@ async function runScriptTool(params) {
     const result = await execWslScript(params.script, shell, params.workdir, { timeoutMs: params.timeout_ms });
     return { content: [{ type: "text", text: formatCommandResult(result) }], structuredContent: result };
 }
-function asRecord(value) {
-    return value && typeof value === "object" ? value : {};
-}
-function optionalString(value) {
-    return typeof value === "string" ? value : undefined;
-}
-function optionalNumber(value) {
-    return typeof value === "number" ? value : undefined;
-}
 function optionalRunMode(value) {
     return value === "sync" || value === "async" || value === "watch" ? value : undefined;
 }
 function optionalTimeoutBehavior(value) {
     return value === "kill" || value === "detach" ? value : undefined;
-}
-function optionalTaskTailChars(args) {
-    return optionalNumber(args.tail_chars) ?? optionalNumber(args.tailChars);
 }
 async function dispatchToolCall(name, argsInput) {
     const args = asRecord(argsInput);
@@ -244,7 +229,7 @@ async function dispatchToolCall(name, argsInput) {
                 waitMs: optionalNumber(args.wait_ms),
                 stdoutOffset: optionalNumber(args.stdoutOffset),
                 stderrOffset: optionalNumber(args.stderrOffset),
-                tailChars: optionalTaskTailChars(args),
+                tailChars: taskTailChars(args),
             });
         case "wsl_exec":
             return runCommandTool({
@@ -310,7 +295,7 @@ async function dispatchToolCall(name, argsInput) {
                 taskId: optionalString(args.taskId),
                 stdoutOffset: optionalNumber(args.stdoutOffset),
                 stderrOffset: optionalNumber(args.stderrOffset),
-                tailChars: optionalTaskTailChars(args),
+                tailChars: taskTailChars(args),
             });
         case "wsl_task_cancel":
             return handleTaskAction({ action: "cancel", taskId: optionalString(args.taskId) });

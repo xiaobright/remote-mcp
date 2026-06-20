@@ -1,14 +1,26 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setTimeout as delay } from "node:timers/promises";
+import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv, readStringArrayJsonEnv } from "@remote-mcp/shared/env";
+import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
+import {
+  buildEnvPreamble,
+  buildWorkdirPreamble,
+  shellQuote,
+  validateShell,
+} from "@remote-mcp/shared/shell";
+import {
+  ProcessTaskManager,
+  type TaskOutput,
+  type TaskSnapshot,
+  type TaskState,
+  type TaskWaitResult,
+} from "@remote-mcp/shared/task-manager";
 
 export type SshRunMode = "sync" | "async" | "watch";
 export type SshTimeoutBehavior = "kill" | "detach";
-export type SshTaskState = "running" | "exited" | "error" | "cancelled";
+export type SshTaskState = TaskState;
 
 export interface SshRunResult {
   target: string;
@@ -39,40 +51,17 @@ export interface SshState {
   [key: string]: unknown;
 }
 
-export interface SshTaskSnapshot {
-  taskId: string;
-  state: SshTaskState;
+export interface SshTaskMeta {
   target: string;
   requestedTarget?: string;
   deviceName?: string;
   command: string;
   shell: string;
   workdir?: string;
-  pid: number | null;
-  startedAt: string;
-  endedAt: string | null;
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
-  error: string | null;
-  stdoutLength: number;
-  stderrLength: number;
-  stdoutTruncated: boolean;
-  stderrTruncated: boolean;
-  [key: string]: unknown;
 }
 
-export interface SshTaskOutput {
-  task: SshTaskSnapshot;
-  stdout: string;
-  stderr: string;
-  stdoutOffset: number;
-  stderrOffset: number;
-  nextStdoutOffset: number;
-  nextStderrOffset: number;
-  stdoutTruncated: boolean;
-  stderrTruncated: boolean;
-  [key: string]: unknown;
-}
+export type SshTaskSnapshot = TaskSnapshot<SshTaskMeta>;
+export type SshTaskOutput = TaskOutput<SshTaskMeta>;
 
 export interface SshTaskOutputOptions {
   stdoutOffset?: number;
@@ -80,10 +69,7 @@ export interface SshTaskOutputOptions {
   tailChars?: number;
 }
 
-export interface SshTaskWaitResult extends SshTaskOutput {
-  completed: boolean;
-  timedOut: boolean;
-  waitedMs: number;
+export interface SshTaskWaitResult extends TaskWaitResult<SshTaskMeta> {
   waitMs: number;
   requestedWaitMs?: number;
   waitClamped?: boolean;
@@ -149,71 +135,6 @@ export interface SshTaskPollInfo {
   [key: string]: unknown;
 }
 
-interface ManagedSshTask {
-  taskId: string;
-  state: SshTaskState;
-  target: string;
-  requestedTarget?: string;
-  deviceName?: string;
-  command: string;
-  shell: string;
-  workdir?: string;
-  proc: ChildProcess | null;
-  pid: number | null;
-  startedAt: string;
-  endedAt: string | null;
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
-  error: string | null;
-  stdout: string;
-  stderr: string;
-  stdoutBaseOffset: number;
-  stderrBaseOffset: number;
-  finished: Promise<void>;
-  resolveFinished: () => void;
-  lastObservationAt: number | null;
-  observationLock: Promise<void>;
-}
-
-function readPositiveIntEnv(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
-  if (!raw) {
-    return fallback;
-  }
-
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function readStringArrayJsonEnv(name: string): string[] | null {
-  const raw = process.env[name]?.trim();
-  if (!raw) {
-    return null;
-  }
-
-  const parsed = JSON.parse(raw) as unknown;
-  if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) {
-    throw new Error(`${name} must be a JSON string array`);
-  }
-
-  return parsed;
-}
-
-function sshSpawnOptions(): { env: NodeJS.ProcessEnv; windowsHide: boolean } {
-  const home = homedir();
-  return {
-    env: {
-      ...process.env,
-      HOME: process.env.HOME || home,
-      USERPROFILE: process.env.USERPROFILE || home,
-      ProgramData: process.env.ProgramData || "C:\\ProgramData",
-      SystemRoot: process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows",
-      WINDIR: process.env.WINDIR || process.env.SystemRoot || process.env.SYSTEMROOT || "C:\\Windows",
-    },
-    windowsHide: true,
-  };
-}
-
 const SSH_COMMAND = process.env.SSH_MCP_COMMAND?.trim() || "ssh";
 const INITIAL_DEFAULT_TARGET = process.env.SSH_MCP_DEFAULT_TARGET?.trim() || null;
 const DEFAULT_SHELL = process.env.SSH_MCP_DEFAULT_SHELL?.trim() || "bash";
@@ -259,45 +180,24 @@ function buildDefaultSshOptions(): string[] {
 
 const DEFAULT_SSH_OPTIONS = buildDefaultSshOptions();
 let currentDefaultTarget: string | null = INITIAL_DEFAULT_TARGET;
-const tasks = new Map<string, ManagedSshTask>();
+const taskManager = new ProcessTaskManager<SshTaskMeta>({
+  outputLimit: TASK_OUTPUT_LIMIT,
+  maxFinishedTasks: MAX_FINISHED_TASKS,
+  minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
+  pollRecommendation: "Use ssh_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
+  unknownTaskLabel: "SSH",
+});
 let deviceStoreCache: SshDeviceStore | null = null;
 
 function nowIso(): string {
   return new Date().toISOString();
 }
 
-function isPositiveInt(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
-}
-
 function boundedDuration(
   requestedMs: number | undefined,
   fallbackMs: number,
 ): { ms: number; requestedMs?: number; clamped: boolean; maxMs: number } {
-  const requested = isPositiveInt(requestedMs) ? requestedMs : undefined;
-  const fallback = Math.min(fallbackMs, MAX_TOOL_TIMEOUT_MS);
-  const ms = Math.min(requested ?? fallback, MAX_TOOL_TIMEOUT_MS);
-  return {
-    ms,
-    requestedMs: requested,
-    clamped: typeof requested === "number" && requested > ms,
-    maxMs: MAX_TOOL_TIMEOUT_MS,
-  };
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-function validateShell(shell: string): string {
-  const trimmed = shell.trim();
-  if (!trimmed) {
-    throw new Error("shell cannot be empty");
-  }
-  if (!/^[A-Za-z0-9_./+-]+$/.test(trimmed)) {
-    throw new Error(`Unsafe shell value: ${shell}`);
-  }
-  return trimmed;
+  return sharedBoundedDuration(requestedMs, fallbackMs, MAX_TOOL_TIMEOUT_MS);
 }
 
 function validateDeviceName(name: string): string {
@@ -501,22 +401,8 @@ function remoteShellArgs(shellInput?: string, login = true): string[] {
   return [shell, "-s"];
 }
 
-function validateEnvName(name: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    throw new Error(`Unsafe environment variable name: ${name}`);
-  }
-  return name;
-}
-
 function buildPreamble(workdir?: string, env?: Record<string, string>): string {
-  const lines: string[] = [];
-  for (const [name, value] of Object.entries(env ?? {})) {
-    lines.push(`export ${validateEnvName(name)}=${shellQuote(String(value))}`);
-  }
-  if (workdir) {
-    lines.push(`cd -- ${shellQuote(workdir)}`);
-  }
-  return lines.length ? `${lines.join("\n")}\n` : "";
+  return buildEnvPreamble(env) + buildWorkdirPreamble(workdir);
 }
 
 function buildScriptInput(script: string, workdir?: string, env?: Record<string, string>): string {
@@ -573,7 +459,7 @@ function buildSshArgs(options: SshRunOptions): { resolved: ResolvedSshTarget; ar
 async function probeCandidateTarget(options: SshRunOptions, resolved: ResolvedSshTarget): Promise<{ ok: boolean; exitCode: number; stderr: string }> {
   const args = buildSshArgsForTarget(options, resolved);
   return new Promise((resolveProbe) => {
-    const proc = spawn(SSH_COMMAND, args, sshSpawnOptions());
+    const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
     let stderr = "";
     let settled = false;
     const timer = setTimeout(() => {
@@ -641,7 +527,7 @@ async function buildSshArgsForRun(options: SshRunOptions): Promise<{
 }
 
 export function getSshState(): SshState {
-  const taskList = [...tasks.values()];
+  const taskList = taskManager.list();
   const store = readDeviceStore();
   return {
     sshCommand: SSH_COMMAND,
@@ -734,7 +620,7 @@ export async function runSshScript(options: SshRunOptions): Promise<SshRunResult
   const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
 
   return new Promise<SshRunResult>((resolve, reject) => {
-    const proc = spawn(SSH_COMMAND, args, sshSpawnOptions());
+    const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -790,249 +676,35 @@ export async function runSshScript(options: SshRunOptions): Promise<SshRunResult
   });
 }
 
-function appendTaskOutput(task: ManagedSshTask, stream: "stdout" | "stderr", data: Buffer): void {
-  const text = data.toString();
-  const baseKey = stream === "stdout" ? "stdoutBaseOffset" : "stderrBaseOffset";
-  task[stream] += text;
-  const overflow = task[stream].length - TASK_OUTPUT_LIMIT;
-  if (overflow > 0) {
-    task[stream] = task[stream].slice(overflow);
-    task[baseKey] += overflow;
-  }
-}
-
-function makeFinishedLatch(): { finished: Promise<void>; resolveFinished: () => void } {
-  let resolveFinished!: () => void;
-  const finished = new Promise<void>((resolve) => {
-    resolveFinished = resolve;
-  });
-  return { finished, resolveFinished };
-}
-
-function taskSnapshot(task: ManagedSshTask): SshTaskSnapshot {
-  return {
-    taskId: task.taskId,
-    state: task.state,
-    target: task.target,
-    requestedTarget: task.requestedTarget,
-    deviceName: task.deviceName,
-    command: task.command,
-    shell: task.shell,
-    workdir: task.workdir,
-    pid: task.pid,
-    startedAt: task.startedAt,
-    endedAt: task.endedAt,
-    exitCode: task.exitCode,
-    signal: task.signal,
-    error: task.error,
-    stdoutLength: task.stdoutBaseOffset + task.stdout.length,
-    stderrLength: task.stderrBaseOffset + task.stderr.length,
-    stdoutTruncated: task.stdoutBaseOffset > 0,
-    stderrTruncated: task.stderrBaseOffset > 0,
-  };
-}
-
-function pruneFinishedTasks(): void {
-  if (MAX_FINISHED_TASKS <= 0) {
-    return;
-  }
-
-  const finished = [...tasks.values()].filter((task) => task.state !== "running");
-  const extra = finished.length - MAX_FINISHED_TASKS;
-  if (extra <= 0) {
-    return;
-  }
-
-  finished
-    .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-    .slice(0, extra)
-    .forEach((task) => tasks.delete(task.taskId));
-}
-
-function sliceTaskStream(
-  content: string,
-  baseOffset: number,
-  requestedOffset?: number,
-  tailChars?: number,
-): { text: string; offset: number; nextOffset: number; truncated: boolean } {
-  const totalLength = baseOffset + content.length;
-  const offset = typeof tailChars === "number"
-    ? Math.max(baseOffset, totalLength - tailChars)
-    : Math.max(baseOffset, requestedOffset ?? baseOffset);
-  const start = offset - baseOffset;
-
-  return {
-    text: content.slice(start),
-    offset,
-    nextOffset: totalLength,
-    truncated: (requestedOffset ?? offset) < baseOffset,
-  };
-}
-
-function getTask(taskId: string): ManagedSshTask {
-  const task = tasks.get(taskId);
-  if (!task) {
-    throw new Error(`Unknown SSH task: ${taskId}`);
-  }
-  return task;
-}
-
-function readTaskOutputUnlocked(
-  task: ManagedSshTask,
-  stdoutOffset?: number,
-  stderrOffset?: number,
-  tailChars?: number,
-): SshTaskOutput {
-  const stdout = sliceTaskStream(task.stdout, task.stdoutBaseOffset, stdoutOffset, tailChars);
-  const stderr = sliceTaskStream(task.stderr, task.stderrBaseOffset, stderrOffset, tailChars);
-
-  return {
-    task: taskSnapshot(task),
-    stdout: stdout.text,
-    stderr: stderr.text,
-    stdoutOffset: stdout.offset,
-    stderrOffset: stderr.offset,
-    nextStdoutOffset: stdout.nextOffset,
-    nextStderrOffset: stderr.nextOffset,
-    stdoutTruncated: stdout.truncated,
-    stderrTruncated: stderr.truncated,
-  };
-}
-
-async function withTaskObservationThrottle<T>(
-  task: ManagedSshTask,
-  fn: (poll: SshTaskPollInfo) => T | Promise<T>,
-): Promise<T> {
-  const previous = task.observationLock;
-  let release!: () => void;
-  task.observationLock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  await previous;
-  try {
-    const now = Date.now();
-    const elapsed = task.lastObservationAt === null ? TASK_MIN_POLL_INTERVAL_MS : now - task.lastObservationAt;
-    const waitMs = task.state === "running" ? Math.max(0, TASK_MIN_POLL_INTERVAL_MS - elapsed) : 0;
-    if (waitMs > 0) {
-      await delay(waitMs);
-    }
-
-    task.lastObservationAt = Date.now();
-    const poll: SshTaskPollInfo = {
-      throttled: waitMs > 0,
-      waitedMs: waitMs,
-      minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
-      recommendedAction: "Use ssh_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
-    };
-    return await fn(poll);
-  } finally {
-    release();
-  }
-}
-
-async function waitForTaskEnd(task: ManagedSshTask, waitMs: number): Promise<boolean> {
-  if (task.state !== "running") {
-    return true;
-  }
-
-  let timer: NodeJS.Timeout | null = null;
-  const timeout = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), waitMs);
-    timer.unref();
-  });
-
-  const result = await Promise.race([
-    task.finished.then(() => "finished" as const),
-    timeout,
-  ]);
-
-  if (timer) {
-    clearTimeout(timer);
-  }
-
-  return result === "finished" || task.state !== "running";
-}
-
 export async function startSshTask(options: SshRunOptions): Promise<SshTaskSnapshot> {
   const { resolved, args } = await buildSshArgsForRun(options);
   const effectiveWorkdir = options.workdir ?? resolved.profile?.defaultWorkdir;
   const input = buildScriptInput(options.script, effectiveWorkdir, options.env);
-  const proc = spawn(SSH_COMMAND, args, sshSpawnOptions());
-  const latch = makeFinishedLatch();
-  const taskId = randomUUID();
+  const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
   const shell = validateShell(options.shell || DEFAULT_SHELL);
-  const task: ManagedSshTask = {
-    taskId,
-    state: "running",
+  return taskManager.start(proc, {
     target: resolved.target,
     requestedTarget: resolved.requestedTarget,
     deviceName: resolved.deviceName,
     command: options.script,
     shell,
     workdir: effectiveWorkdir,
-    proc,
-    pid: proc.pid ?? null,
-    startedAt: nowIso(),
-    endedAt: null,
-    exitCode: null,
-    signal: null,
-    error: null,
-    stdout: "",
-    stderr: "",
-    stdoutBaseOffset: 0,
-    stderrBaseOffset: 0,
-    finished: latch.finished,
-    resolveFinished: latch.resolveFinished,
-    lastObservationAt: null,
-    observationLock: Promise.resolve(),
-  };
-
-  tasks.set(taskId, task);
-
-  proc.stdout?.on("data", (data: Buffer) => appendTaskOutput(task, "stdout", data));
-  proc.stderr?.on("data", (data: Buffer) => appendTaskOutput(task, "stderr", data));
-  proc.on("close", (code, signal) => {
-    if (task.state !== "cancelled") {
-      task.state = "exited";
-    }
-    task.exitCode = code ?? -1;
-    task.signal = signal;
-    task.endedAt ??= nowIso();
-    task.proc = null;
-    task.pid = null;
-    task.resolveFinished();
-    if ((code ?? -1) === 0 && resolved.profile) {
+  }, {
+    input,
+    onSuccessfulExit: () => {
+      if (resolved.profile) {
       rememberResolvedDevice(resolved.profile, resolved.target);
-    }
-    pruneFinishedTasks();
+      }
+    },
   });
-  proc.on("error", (error) => {
-    task.state = "error";
-    task.error = error.message;
-    task.endedAt ??= nowIso();
-    task.proc = null;
-    task.pid = null;
-    task.resolveFinished();
-    pruneFinishedTasks();
-  });
-
-  proc.stdin?.write(input);
-  proc.stdin?.end();
-
-  return taskSnapshot(task);
 }
 
 export function listTasks(): SshTaskSnapshot[] {
-  return [...tasks.values()].map(taskSnapshot);
+  return taskManager.list();
 }
 
 export async function observeTaskStatus(taskId: string): Promise<SshTaskSnapshot> {
-  const task = getTask(taskId);
-  return withTaskObservationThrottle(task, (poll) => ({
-    ...taskSnapshot(task),
-    poll,
-  }));
+  return taskManager.observeStatus(taskId);
 }
 
 export async function observeTaskOutput(
@@ -1041,11 +713,7 @@ export async function observeTaskOutput(
   stderrOffset?: number,
   tailChars?: number,
 ): Promise<SshTaskOutput> {
-  const task = getTask(taskId);
-  return withTaskObservationThrottle(task, (poll) => ({
-    ...readTaskOutputUnlocked(task, stdoutOffset, stderrOffset, tailChars),
-    poll,
-  }));
+  return taskManager.observeOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
 }
 
 export function readTaskOutput(
@@ -1054,7 +722,7 @@ export function readTaskOutput(
   stderrOffset?: number,
   tailChars?: number,
 ): SshTaskOutput {
-  return readTaskOutputUnlocked(getTask(taskId), stdoutOffset, stderrOffset, tailChars);
+  return taskManager.readOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
 }
 
 export async function waitTask(
@@ -1062,16 +730,10 @@ export async function waitTask(
   waitMs = DEFAULT_TASK_WAIT_MS,
   options: SshTaskOutputOptions = {},
 ): Promise<SshTaskWaitResult> {
-  const task = getTask(taskId);
   const wait = boundedDuration(waitMs, DEFAULT_TASK_WAIT_MS);
-  const started = Date.now();
-  const completed = await waitForTaskEnd(task, wait.ms);
-  const waitedMs = Date.now() - started;
+  const output = await taskManager.wait(taskId, wait.ms, options);
   return {
-    ...readTaskOutputUnlocked(task, options.stdoutOffset, options.stderrOffset, options.tailChars),
-    completed,
-    timedOut: !completed,
-    waitedMs,
+    ...output,
     waitMs: wait.ms,
     requestedWaitMs: wait.requestedMs,
     waitClamped: wait.clamped,
@@ -1115,26 +777,11 @@ export async function watchSshTask(
 }
 
 export function cancelTask(taskId: string): SshTaskSnapshot {
-  const task = getTask(taskId);
-  if (task.state === "running" && task.proc) {
-    task.state = "cancelled";
-    task.endedAt = nowIso();
-    task.proc.kill();
-    task.resolveFinished();
-  }
-
-  return taskSnapshot(task);
+  return taskManager.cancel(taskId);
 }
 
 export function cancelAllTasksSync(): void {
-  for (const task of tasks.values()) {
-    if (task.state === "running" && task.proc) {
-      task.state = "cancelled";
-      task.endedAt = nowIso();
-      task.proc.kill();
-      task.resolveFinished();
-    }
-  }
+  taskManager.cancelAllSync();
 }
 
 export async function testSshTarget(target?: string, timeoutMs = 15000): Promise<SshRunResult> {

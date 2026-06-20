@@ -1,6 +1,7 @@
+import { type TaskOutput, type TaskSnapshot, type TaskState, type TaskWaitResult } from "@remote-mcp/shared/task-manager";
 export type SshRunMode = "sync" | "async" | "watch";
 export type SshTimeoutBehavior = "kill" | "detach";
-export type SshTaskState = "running" | "exited" | "error" | "cancelled";
+export type SshTaskState = TaskState;
 export interface SshRunResult {
     target: string;
     requestedTarget?: string;
@@ -28,48 +29,22 @@ export interface SshState {
     taskCount: number;
     [key: string]: unknown;
 }
-export interface SshTaskSnapshot {
-    taskId: string;
-    state: SshTaskState;
+export interface SshTaskMeta {
     target: string;
     requestedTarget?: string;
     deviceName?: string;
     command: string;
     shell: string;
     workdir?: string;
-    pid: number | null;
-    startedAt: string;
-    endedAt: string | null;
-    exitCode: number | null;
-    signal: NodeJS.Signals | null;
-    error: string | null;
-    stdoutLength: number;
-    stderrLength: number;
-    stdoutTruncated: boolean;
-    stderrTruncated: boolean;
-    [key: string]: unknown;
 }
-export interface SshTaskOutput {
-    task: SshTaskSnapshot;
-    stdout: string;
-    stderr: string;
-    stdoutOffset: number;
-    stderrOffset: number;
-    nextStdoutOffset: number;
-    nextStderrOffset: number;
-    stdoutTruncated: boolean;
-    stderrTruncated: boolean;
-    [key: string]: unknown;
-}
+export type SshTaskSnapshot = TaskSnapshot<SshTaskMeta>;
+export type SshTaskOutput = TaskOutput<SshTaskMeta>;
 export interface SshTaskOutputOptions {
     stdoutOffset?: number;
     stderrOffset?: number;
     tailChars?: number;
 }
-export interface SshTaskWaitResult extends SshTaskOutput {
-    completed: boolean;
-    timedOut: boolean;
-    waitedMs: number;
+export interface SshTaskWaitResult extends TaskWaitResult<SshTaskMeta> {
     waitMs: number;
     requestedWaitMs?: number;
     waitClamped?: boolean;

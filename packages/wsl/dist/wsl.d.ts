@@ -1,3 +1,4 @@
+import { type TaskOutput, type TaskSnapshot, type TaskState, type TaskWaitResult } from "@remote-mcp/shared/task-manager";
 export interface WslResult {
     stdout: string;
     stderr: string;
@@ -17,38 +18,15 @@ export interface WslSessionState {
     lastError: string | null;
     [key: string]: unknown;
 }
-export type WslTaskState = "running" | "exited" | "error" | "cancelled";
-export interface WslTaskSnapshot {
-    taskId: string;
-    state: WslTaskState;
+export type WslTaskState = TaskState;
+export interface WslTaskMeta {
     command: string;
     shell: string;
     workdir?: string;
     configuredDistro: string | null;
-    pid: number | null;
-    startedAt: string;
-    endedAt: string | null;
-    exitCode: number | null;
-    signal: NodeJS.Signals | null;
-    error: string | null;
-    stdoutLength: number;
-    stderrLength: number;
-    stdoutTruncated: boolean;
-    stderrTruncated: boolean;
-    [key: string]: unknown;
 }
-export interface WslTaskOutput {
-    task: WslTaskSnapshot;
-    stdout: string;
-    stderr: string;
-    stdoutOffset: number;
-    stderrOffset: number;
-    nextStdoutOffset: number;
-    nextStderrOffset: number;
-    stdoutTruncated: boolean;
-    stderrTruncated: boolean;
-    [key: string]: unknown;
-}
+export type WslTaskSnapshot = TaskSnapshot<WslTaskMeta>;
+export type WslTaskOutput = TaskOutput<WslTaskMeta>;
 export type WslRunMode = "sync" | "async" | "watch";
 export type WslTimeoutBehavior = "kill" | "detach";
 export interface WslSyncOptions {
@@ -66,10 +44,7 @@ export interface WslTaskOutputOptions {
     stderrOffset?: number;
     tailChars?: number;
 }
-export interface WslTaskWaitResult extends WslTaskOutput {
-    completed: boolean;
-    timedOut: boolean;
-    waitedMs: number;
+export interface WslTaskWaitResult extends TaskWaitResult<WslTaskMeta> {
     waitMs: number;
     requestedWaitMs?: number;
     waitClamped?: boolean;

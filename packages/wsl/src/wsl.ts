@@ -1,6 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv } from "@remote-mcp/shared/env";
+import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
+import { buildWorkdirPreamble } from "@remote-mcp/shared/shell";
+import {
+  ProcessTaskManager,
+  type TaskOutput,
+  type TaskSnapshot,
+  type TaskState,
+  type TaskWaitResult,
+} from "@remote-mcp/shared/task-manager";
 
 export interface WslResult {
   stdout: string;
@@ -23,40 +32,17 @@ export interface WslSessionState {
   [key: string]: unknown;
 }
 
-export type WslTaskState = "running" | "exited" | "error" | "cancelled";
+export type WslTaskState = TaskState;
 
-export interface WslTaskSnapshot {
-  taskId: string;
-  state: WslTaskState;
+export interface WslTaskMeta {
   command: string;
   shell: string;
   workdir?: string;
   configuredDistro: string | null;
-  pid: number | null;
-  startedAt: string;
-  endedAt: string | null;
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
-  error: string | null;
-  stdoutLength: number;
-  stderrLength: number;
-  stdoutTruncated: boolean;
-  stderrTruncated: boolean;
-  [key: string]: unknown;
 }
 
-export interface WslTaskOutput {
-  task: WslTaskSnapshot;
-  stdout: string;
-  stderr: string;
-  stdoutOffset: number;
-  stderrOffset: number;
-  nextStdoutOffset: number;
-  nextStderrOffset: number;
-  stdoutTruncated: boolean;
-  stderrTruncated: boolean;
-  [key: string]: unknown;
-}
+export type WslTaskSnapshot = TaskSnapshot<WslTaskMeta>;
+export type WslTaskOutput = TaskOutput<WslTaskMeta>;
 
 export type WslRunMode = "sync" | "async" | "watch";
 export type WslTimeoutBehavior = "kill" | "detach";
@@ -79,10 +65,7 @@ export interface WslTaskOutputOptions {
   tailChars?: number;
 }
 
-export interface WslTaskWaitResult extends WslTaskOutput {
-  completed: boolean;
-  timedOut: boolean;
-  waitedMs: number;
+export interface WslTaskWaitResult extends TaskWaitResult<WslTaskMeta> {
   waitMs: number;
   requestedWaitMs?: number;
   waitClamped?: boolean;
@@ -100,41 +83,7 @@ export interface WslWatchResult extends WslTaskWaitResult {
   [key: string]: unknown;
 }
 
-interface ManagedWslTask {
-  taskId: string;
-  state: WslTaskState;
-  command: string;
-  shell: string;
-  workdir?: string;
-  configuredDistro: string | null;
-  proc: ChildProcess | null;
-  pid: number | null;
-  startedAt: string;
-  endedAt: string | null;
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
-  error: string | null;
-  stdout: string;
-  stderr: string;
-  stdoutBaseOffset: number;
-  stderrBaseOffset: number;
-  finished: Promise<void>;
-  resolveFinished: () => void;
-  lastObservationAt: number | null;
-  observationLock: Promise<void>;
-}
-
 const WSL_EXE = "wsl.exe";
-
-function readPositiveIntEnv(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
-  if (!raw) {
-    return fallback;
-  }
-
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
 
 const DEFAULT_DISTRO = process.env.WSL_MCP_DEFAULT_DISTRO?.trim() || "Ubuntu-24.04";
 const TASK_OUTPUT_LIMIT = readPositiveIntEnv("WSL_MCP_TASK_OUTPUT_LIMIT", 1048576);
@@ -151,7 +100,13 @@ let currentDistro: string | null = DEFAULT_DISTRO;
 let lastSessionError: string | null = null;
 const expectedKeepaliveExits = new WeakSet<ChildProcess>();
 let sessionLock: Promise<void> = Promise.resolve();
-const tasks = new Map<string, ManagedWslTask>();
+const taskManager = new ProcessTaskManager<WslTaskMeta>({
+  outputLimit: TASK_OUTPUT_LIMIT,
+  maxFinishedTasks: MAX_FINISHED_TASKS,
+  minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
+  pollRecommendation: "Use wsl_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
+  unknownTaskLabel: "WSL",
+});
 
 async function withSessionLock<T>(fn: () => Promise<T> | T): Promise<T> {
   const previous = sessionLock;
@@ -232,12 +187,8 @@ function bindKeepaliveLifecycle(proc: ChildProcess): void {
   });
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 function buildPreamble(workdir?: string): string {
-  return workdir ? `cd -- ${shellQuote(workdir)}\n` : "";
+  return buildWorkdirPreamble(workdir);
 }
 
 const MNT_DELETE_GUARD = String.raw`
@@ -355,196 +306,16 @@ function buildScriptInput(body: string, workdir?: string): string {
   return buildSafetyPreamble() + buildPreamble(workdir) + body;
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-function isPositiveInt(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
-}
-
 function boundedDuration(
   requestedMs: number | undefined,
   fallbackMs: number,
 ): { ms: number; requestedMs?: number; clamped: boolean; maxMs: number } {
-  const requested = isPositiveInt(requestedMs) ? requestedMs : undefined;
-  const fallback = Math.min(fallbackMs, MAX_TOOL_TIMEOUT_MS);
-  const ms = Math.min(requested ?? fallback, MAX_TOOL_TIMEOUT_MS);
-  return {
-    ms,
-    requestedMs: requested,
-    clamped: typeof requested === "number" && requested > ms,
-    maxMs: MAX_TOOL_TIMEOUT_MS,
-  };
-}
-
-function appendTaskOutput(task: ManagedWslTask, stream: "stdout" | "stderr", data: Buffer): void {
-  const text = data.toString();
-  const bufferKey = stream;
-  const baseKey = stream === "stdout" ? "stdoutBaseOffset" : "stderrBaseOffset";
-
-  task[bufferKey] += text;
-  const overflow = task[bufferKey].length - TASK_OUTPUT_LIMIT;
-  if (overflow > 0) {
-    task[bufferKey] = task[bufferKey].slice(overflow);
-    task[baseKey] += overflow;
-  }
-}
-
-function taskSnapshot(task: ManagedWslTask): WslTaskSnapshot {
-  return {
-    taskId: task.taskId,
-    state: task.state,
-    command: task.command,
-    shell: task.shell,
-    workdir: task.workdir,
-    configuredDistro: task.configuredDistro,
-    pid: task.pid,
-    startedAt: task.startedAt,
-    endedAt: task.endedAt,
-    exitCode: task.exitCode,
-    signal: task.signal,
-    error: task.error,
-    stdoutLength: task.stdoutBaseOffset + task.stdout.length,
-    stderrLength: task.stderrBaseOffset + task.stderr.length,
-    stdoutTruncated: task.stdoutBaseOffset > 0,
-    stderrTruncated: task.stderrBaseOffset > 0,
-  };
-}
-
-function makeFinishedLatch(): { finished: Promise<void>; resolveFinished: () => void } {
-  let resolveFinished!: () => void;
-  const finished = new Promise<void>((resolve) => {
-    resolveFinished = resolve;
-  });
-  return { finished, resolveFinished };
-}
-
-function getTask(taskId: string): ManagedWslTask {
-  const task = tasks.get(taskId);
-  if (!task) {
-    throw new Error(`Unknown WSL task: ${taskId}`);
-  }
-  return task;
-}
-
-function readTaskOutputUnlocked(
-  task: ManagedWslTask,
-  stdoutOffset?: number,
-  stderrOffset?: number,
-  tailChars?: number,
-): WslTaskOutput {
-  const stdout = sliceTaskStream(task.stdout, task.stdoutBaseOffset, stdoutOffset, tailChars);
-  const stderr = sliceTaskStream(task.stderr, task.stderrBaseOffset, stderrOffset, tailChars);
-
-  return {
-    task: taskSnapshot(task),
-    stdout: stdout.text,
-    stderr: stderr.text,
-    stdoutOffset: stdout.offset,
-    stderrOffset: stderr.offset,
-    nextStdoutOffset: stdout.nextOffset,
-    nextStderrOffset: stderr.nextOffset,
-    stdoutTruncated: stdout.truncated,
-    stderrTruncated: stderr.truncated,
-  };
-}
-
-async function withTaskObservationThrottle<T>(
-  task: ManagedWslTask,
-  fn: (poll: WslTaskPollInfo) => T | Promise<T>,
-): Promise<T> {
-  const previous = task.observationLock;
-  let release!: () => void;
-  task.observationLock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  await previous;
-  try {
-    const now = Date.now();
-    const elapsed = task.lastObservationAt === null ? TASK_MIN_POLL_INTERVAL_MS : now - task.lastObservationAt;
-    const waitMs = task.state === "running" ? Math.max(0, TASK_MIN_POLL_INTERVAL_MS - elapsed) : 0;
-    if (waitMs > 0) {
-      await delay(waitMs);
-    }
-
-    task.lastObservationAt = Date.now();
-    const poll: WslTaskPollInfo = {
-      throttled: waitMs > 0,
-      waitedMs: waitMs,
-      minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
-      recommendedAction: "Use wsl_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
-    };
-    return await fn(poll);
-  } finally {
-    release();
-  }
-}
-
-async function waitForTaskEnd(task: ManagedWslTask, waitMs: number): Promise<boolean> {
-  if (task.state !== "running") {
-    return true;
-  }
-
-  let timer: NodeJS.Timeout | null = null;
-  const timeout = new Promise<"timeout">((resolve) => {
-    timer = setTimeout(() => resolve("timeout"), waitMs);
-    timer.unref();
-  });
-
-  const result = await Promise.race([
-    task.finished.then(() => "finished" as const),
-    timeout,
-  ]);
-
-  if (timer) {
-    clearTimeout(timer);
-  }
-
-  return result === "finished" || task.state !== "running";
-}
-
-function pruneFinishedTasks(): void {
-  if (MAX_FINISHED_TASKS <= 0) {
-    return;
-  }
-
-  const finished = [...tasks.values()].filter((task) => task.state !== "running");
-  const extra = finished.length - MAX_FINISHED_TASKS;
-  if (extra <= 0) {
-    return;
-  }
-
-  finished
-    .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-    .slice(0, extra)
-    .forEach((task) => tasks.delete(task.taskId));
-}
-
-function sliceTaskStream(
-  content: string,
-  baseOffset: number,
-  requestedOffset?: number,
-  tailChars?: number,
-): { text: string; offset: number; nextOffset: number; truncated: boolean } {
-  const totalLength = baseOffset + content.length;
-  const offset = typeof tailChars === "number"
-    ? Math.max(baseOffset, totalLength - tailChars)
-    : Math.max(baseOffset, requestedOffset ?? baseOffset);
-  const start = offset - baseOffset;
-
-  return {
-    text: content.slice(start),
-    offset,
-    nextOffset: totalLength,
-    truncated: (requestedOffset ?? offset) < baseOffset,
-  };
+  return sharedBoundedDuration(requestedMs, fallbackMs, MAX_TOOL_TIMEOUT_MS);
 }
 
 async function probeWsl(distro: string | null): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const proc = spawn(WSL_EXE, [...wslArgsFor(distro, ["bash", "-lc", "true"])], { windowsHide: true });
+    const proc = spawn(WSL_EXE, [...wslArgsFor(distro, ["bash", "-lc", "true"])], windowsHiddenSpawnOptions());
     let stderr = "";
     proc.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
     proc.on("close", (code) => {
@@ -624,10 +395,9 @@ async function startSessionUnlocked(distro?: string | null): Promise<WslSessionS
   const distroForStart = currentDistro;
   await probeWsl(distroForStart);
 
-  const proc = spawn(WSL_EXE, [...wslArgsFor(distroForStart, ["bash", "-lc", "while true; do sleep 30; done"])], {
+  const proc = spawn(WSL_EXE, [...wslArgsFor(distroForStart, ["bash", "-lc", "while true; do sleep 30; done"])], windowsHiddenSpawnOptions({
     stdio: "ignore",
-    windowsHide: true,
-  });
+  }));
   keepalive = proc;
   bindKeepaliveLifecycle(proc);
   proc.unref();
@@ -662,7 +432,7 @@ async function spawnWslCommand(cmdArgs: string[], input: string, options: WslSyn
     withSessionLock(async () => {
       await startSessionUnlocked();
       const args = wslArgsFor(currentDistro, cmdArgs);
-      const proc = spawn(WSL_EXE, args, { windowsHide: true });
+      const proc = spawn(WSL_EXE, args, windowsHiddenSpawnOptions());
       const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
       let stdout = "";
       let stderr = "";
@@ -727,78 +497,27 @@ export async function execWslScript(
 }
 
 async function startWslTask(command: string, shell: string, workdir?: string): Promise<WslTaskSnapshot> {
-  let createdTask: ManagedWslTask | null = null;
+  let createdTask: WslTaskSnapshot | null = null;
 
   await withSessionLock(async () => {
     await startSessionUnlocked();
 
-    const taskId = randomUUID();
     const configuredDistro = currentDistro;
-    const proc = spawn(WSL_EXE, wslArgsFor(configuredDistro, [shell, "-l", "-s"]), { windowsHide: true });
-    const latch = makeFinishedLatch();
-    const task: ManagedWslTask = {
-      taskId,
-      state: "running",
+    const proc = spawn(WSL_EXE, wslArgsFor(configuredDistro, [shell, "-l", "-s"]), windowsHiddenSpawnOptions());
+    const input = buildScriptInput(command.endsWith("\n") ? command : `${command}\n`, workdir);
+    createdTask = taskManager.start(proc, {
       command,
       shell,
       workdir,
       configuredDistro,
-      proc,
-      pid: proc.pid ?? null,
-      startedAt: nowIso(),
-      endedAt: null,
-      exitCode: null,
-      signal: null,
-      error: null,
-      stdout: "",
-      stderr: "",
-      stdoutBaseOffset: 0,
-      stderrBaseOffset: 0,
-      finished: latch.finished,
-      resolveFinished: latch.resolveFinished,
-      lastObservationAt: null,
-      observationLock: Promise.resolve(),
-    };
-
-    tasks.set(taskId, task);
-    createdTask = task;
-
-    proc.stdout?.on("data", (data: Buffer) => appendTaskOutput(task, "stdout", data));
-    proc.stderr?.on("data", (data: Buffer) => appendTaskOutput(task, "stderr", data));
-    proc.on("close", (code, signal) => {
-      if (task.state !== "cancelled") {
-        task.state = "exited";
-      }
-      task.exitCode = code ?? -1;
-      task.signal = signal;
-      task.endedAt ??= nowIso();
-      task.proc = null;
-      task.pid = null;
-      task.resolveFinished();
-      pruneFinishedTasks();
-    });
-    proc.on("error", (error) => {
-      task.state = "error";
-      task.error = error.message;
-      task.endedAt ??= nowIso();
-      task.proc = null;
-      task.pid = null;
-      task.resolveFinished();
-      pruneFinishedTasks();
-    });
-
-    proc.stdin?.write(buildScriptInput(command, workdir));
-    if (!command.endsWith("\n")) {
-      proc.stdin?.write("\n");
-    }
-    proc.stdin?.end();
+    }, { input });
   });
 
   if (!createdTask) {
     throw new Error("Failed to create WSL task.");
   }
 
-  return taskSnapshot(createdTask);
+  return createdTask;
 }
 
 export async function execWslAsync(command: string, workdir?: string): Promise<WslTaskSnapshot> {
@@ -810,11 +529,11 @@ export async function execWslScriptAsync(script: string, shell = "bash", workdir
 }
 
 export function listTasks(): WslTaskSnapshot[] {
-  return [...tasks.values()].map(taskSnapshot);
+  return taskManager.list();
 }
 
 export function getTaskStatus(taskId: string): WslTaskSnapshot {
-  return taskSnapshot(getTask(taskId));
+  return taskManager.status(taskId);
 }
 
 export function readTaskOutput(
@@ -823,15 +542,11 @@ export function readTaskOutput(
   stderrOffset?: number,
   tailChars?: number,
 ): WslTaskOutput {
-  return readTaskOutputUnlocked(getTask(taskId), stdoutOffset, stderrOffset, tailChars);
+  return taskManager.readOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
 }
 
 export async function observeTaskStatus(taskId: string): Promise<WslTaskSnapshot> {
-  const task = getTask(taskId);
-  return withTaskObservationThrottle(task, (poll) => ({
-    ...taskSnapshot(task),
-    poll,
-  }));
+  return taskManager.observeStatus(taskId);
 }
 
 export async function observeTaskOutput(
@@ -840,11 +555,7 @@ export async function observeTaskOutput(
   stderrOffset?: number,
   tailChars?: number,
 ): Promise<WslTaskOutput> {
-  const task = getTask(taskId);
-  return withTaskObservationThrottle(task, (poll) => ({
-    ...readTaskOutputUnlocked(task, stdoutOffset, stderrOffset, tailChars),
-    poll,
-  }));
+  return taskManager.observeOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
 }
 
 export async function waitTask(
@@ -852,16 +563,10 @@ export async function waitTask(
   waitMs = DEFAULT_TASK_WAIT_MS,
   options: WslTaskOutputOptions = {},
 ): Promise<WslTaskWaitResult> {
-  const task = getTask(taskId);
   const wait = boundedDuration(waitMs, DEFAULT_TASK_WAIT_MS);
-  const started = Date.now();
-  const completed = await waitForTaskEnd(task, wait.ms);
-  const waitedMs = Date.now() - started;
+  const output = await taskManager.wait(taskId, wait.ms, options);
   return {
-    ...readTaskOutputUnlocked(task, options.stdoutOffset, options.stderrOffset, options.tailChars),
-    completed,
-    timedOut: !completed,
-    waitedMs,
+    ...output,
     waitMs: wait.ms,
     requestedWaitMs: wait.requestedMs,
     waitClamped: wait.clamped,
@@ -907,30 +612,16 @@ export async function watchWslTask(
 }
 
 export function cancelTask(taskId: string): WslTaskSnapshot {
-  const task = getTask(taskId);
-  if (task.state === "running" && task.proc) {
-    task.state = "cancelled";
-    task.endedAt = nowIso();
-    task.proc.kill();
-    task.resolveFinished();
-  }
-
-  return taskSnapshot(task);
+  return taskManager.cancel(taskId);
 }
 
 export function cancelAllTasksSync(): void {
-  for (const task of tasks.values()) {
-    if (task.state === "running" && task.proc) {
-      task.state = "cancelled";
-      task.endedAt = nowIso();
-      task.proc.kill();
-    }
-  }
+  taskManager.cancelAllSync();
 }
 
 export async function listDistros(): Promise<string[]> {
   return new Promise<string[]>((resolve, reject) => {
-    const proc = spawn(WSL_EXE, ["-l", "-q"], { windowsHide: true });
+    const proc = spawn(WSL_EXE, ["-l", "-q"], windowsHiddenSpawnOptions());
     let chunks: Buffer[] = [];
     proc.stdout?.on("data", (data: Buffer) => { chunks.push(data); });
     proc.on("close", (code) => {
