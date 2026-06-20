@@ -1,0 +1,27 @@
+{
+  "name": "remote-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "start:ssh": "npm --workspace @remote-mcp/ssh start",
+    "start:wsl": "npm --workspace @remote-mcp/wsl start",
+    "start:remote-fs": "npm --workspace @remote-mcp/remote-fs start"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
