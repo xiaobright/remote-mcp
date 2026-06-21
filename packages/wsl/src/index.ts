@@ -11,11 +11,13 @@ import {
   optionalString,
   taskTailChars,
 } from "@remote-mcp/shared/mcp";
+import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
 import {
   execWsl,
   execWslAsync,
   execWslScript,
   execWslScriptAsync,
+  runWslRawScript,
   watchWslTask,
   startSession,
   stopSession,
@@ -46,6 +48,23 @@ function formatDistro(distro: string | null): string {
 
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
+
+const wslFileToolHandlers = registerRemoteFileTools({
+  server,
+  prefix: "wsl_file",
+  titlePrefix: "WSL",
+  targetDescription: "Uses this MCP process's configured WSL distro and keepalive session.",
+  targetFields: {
+    timeout_ms: z.number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Timeout for each underlying WSL shell operation."),
+  },
+  makeRunner: (params) => (script) => runWslRawScript(script, {
+    timeoutMs: optionalNumber(params.timeout_ms),
+  }),
+});
 
 function formatCommandResult(result: {
   stdout: string;
@@ -297,6 +316,10 @@ function optionalTimeoutBehavior(value: unknown): WslTimeoutBehavior | undefined
 
 async function dispatchToolCall(name: string, argsInput: unknown) {
   const args = asRecord(argsInput);
+  const fileHandler = wslFileToolHandlers[name];
+  if (fileHandler) {
+    return fileHandler(args);
+  }
 
   switch (name) {
     case "wsl_session":

@@ -4,7 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { asRecord, errorResponse, optionalNumber, optionalString, taskTailChars, } from "@remote-mcp/shared/mcp";
-import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, } from "./wsl.js";
+import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
+import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, runWslRawScript, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, } from "./wsl.js";
 const server = new McpServer({
     name: "wsl-mcp-server",
     version: "1.0.0",
@@ -14,6 +15,22 @@ function formatDistro(distro) {
 }
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
+const wslFileToolHandlers = registerRemoteFileTools({
+    server,
+    prefix: "wsl_file",
+    titlePrefix: "WSL",
+    targetDescription: "Uses this MCP process's configured WSL distro and keepalive session.",
+    targetFields: {
+        timeout_ms: z.number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Timeout for each underlying WSL shell operation."),
+    },
+    makeRunner: (params) => (script) => runWslRawScript(script, {
+        timeoutMs: optionalNumber(params.timeout_ms),
+    }),
+});
 function formatCommandResult(result) {
     return [
         result.stdout,
@@ -216,6 +233,10 @@ function optionalTimeoutBehavior(value) {
 }
 async function dispatchToolCall(name, argsInput) {
     const args = asRecord(argsInput);
+    const fileHandler = wslFileToolHandlers[name];
+    if (fileHandler) {
+        return fileHandler(args);
+    }
     switch (name) {
         case "wsl_session":
             return handleSessionAction({

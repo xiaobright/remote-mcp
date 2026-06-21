@@ -433,14 +433,14 @@ export function candidateTargetsFor(target) {
         profile,
     }));
 }
-export async function runSshScript(options) {
+export async function runSshRawScript(options) {
     const { resolved, args, attemptedTargets } = await buildSshArgsForRun(options);
     const effectiveWorkdir = options.workdir ?? resolved.profile?.defaultWorkdir;
     const input = buildScriptInput(options.script, effectiveWorkdir, options.env);
     const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
     return new Promise((resolve, reject) => {
         const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
-        let stdout = "";
+        const stdout = [];
         let stderr = "";
         let timedOut = false;
         let settled = false;
@@ -450,7 +450,7 @@ export async function runSshScript(options) {
             proc.kill();
         }, timeout.ms);
         timer.unref();
-        proc.stdout?.on("data", (data) => { stdout += data.toString(); });
+        proc.stdout?.on("data", (data) => { stdout.push(data); });
         proc.stderr?.on("data", (data) => { stderr += data.toString(); });
         proc.on("close", (code) => {
             if (settled) {
@@ -464,7 +464,7 @@ export async function runSshScript(options) {
                 target: resolved.target,
                 requestedTarget: resolved.requestedTarget,
                 deviceName: resolved.deviceName,
-                stdout,
+                stdout: Buffer.concat(stdout),
                 stderr,
                 exitCode: code ?? -1,
                 timedOut,
@@ -491,6 +491,13 @@ export async function runSshScript(options) {
         proc.stdin?.write(input);
         proc.stdin?.end();
     });
+}
+export async function runSshScript(options) {
+    const result = await runSshRawScript(options);
+    return {
+        ...result,
+        stdout: result.stdout.toString("utf8"),
+    };
 }
 export async function startSshTask(options) {
     const { resolved, args } = await buildSshArgsForRun(options);

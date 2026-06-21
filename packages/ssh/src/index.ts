@@ -14,6 +14,7 @@ import {
   optionalStringRecord,
   taskTailChars,
 } from "@remote-mcp/shared/mcp";
+import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
 import {
   cancelAllTasksSync,
   cancelTask,
@@ -25,6 +26,7 @@ import {
   observeTaskOutput,
   observeTaskStatus,
   removeDevice,
+  runSshRawScript,
   runSshScript,
   setDefaultTarget,
   startSshTask,
@@ -44,6 +46,34 @@ const server = new McpServer({
 
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
+
+const sshFileToolHandlers = registerRemoteFileTools({
+  server,
+  prefix: "ssh_file",
+  titlePrefix: "SSH",
+  targetDescription: "Uses ssh_profile target resolution, device profiles, and SSH options.",
+  targetFields: {
+    target: z.string()
+      .optional()
+      .describe("SSH target or saved device name. Omit to use SSH_MCP_DEFAULT_TARGET or ssh_profile set_default."),
+    ssh_options: z.array(z.string())
+      .optional()
+      .describe('Extra ssh argv items, e.g. ["-p","2222","-i","C:/path/key"].'),
+    timeout_ms: z.number()
+      .int()
+      .positive()
+      .optional()
+      .describe("Timeout for each underlying SSH shell operation."),
+  },
+  makeRunner: (params) => (script) => runSshRawScript({
+    target: optionalString(params.target),
+    script,
+    shell: "sh",
+    login: false,
+    sshOptions: optionalStringArray(params.ssh_options),
+    timeoutMs: optionalNumber(params.timeout_ms),
+  }),
+});
 
 function formatCommandResult(result: {
   target?: string;
@@ -335,6 +365,10 @@ async function runScriptTool(params: {
 
 async function dispatchToolCall(name: string, argsInput: unknown) {
   const args = asRecord(argsInput);
+  const fileHandler = sshFileToolHandlers[name];
+  if (fileHandler) {
+    return fileHandler(args);
+  }
 
   switch (name) {
     case "ssh_profile":

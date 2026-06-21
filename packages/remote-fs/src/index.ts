@@ -5,10 +5,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import {
   applyUpdatePatch,
+  encodeRemoteText,
   joinRemotePath,
   listDir,
   parsePatch,
-  readTextFile,
+  readTextFileDecoded,
   searchText,
   sha256Text,
   statPath,
@@ -46,6 +47,10 @@ const targetFields = {
     .describe("Optional remote root joined with relative paths before execution."),
 };
 
+const encodingField = z.string()
+  .optional()
+  .describe('Text encoding for file content. Defaults to "auto"; explicit values include "utf-8", "gbk", and "gb18030".');
+
 function targetFrom(params: {
   transport: "wsl" | "ssh";
   target?: string;
@@ -70,18 +75,55 @@ function resolvePath(root: string | undefined, path: string): string {
   return resolved;
 }
 
+function requestedEncoding(params: { encoding?: string }): string {
+  return params.encoding ?? "auto";
+}
+
+function isAutoEncoding(value: string | undefined): boolean {
+  return !value || value.trim().toLowerCase().replace(/_/g, "-") === "auto";
+}
+
+async function resolveWriteEncoding(
+  target: RemoteTarget,
+  path: string,
+  params: { encoding?: string; max_bytes?: number },
+  overwrite: boolean,
+): Promise<string> {
+  if (!isAutoEncoding(params.encoding)) {
+    return params.encoding ?? "utf-8";
+  }
+
+  if (!overwrite) {
+    return "utf-8";
+  }
+
+  const info = await statPath(target, path);
+  if (!info.exists || (info.type && info.type !== "file")) {
+    return "utf-8";
+  }
+
+  const decoded = await readTextFileDecoded(target, path, {
+    maxBytes: params.max_bytes,
+    encoding: "auto",
+  });
+  return decoded.encoding;
+}
+
 server.registerTool(
   "remote_file_read",
   {
     title: "Read Remote File",
-    description: `Read a UTF-8 text file over SSH or WSL.
+    description: `Read a remote text file over SSH or WSL.
 
 This is for observation. It does not require Python or Node on the remote host;
-the remote side only needs a basic POSIX shell plus cat/wc.`,
+the remote side only needs a basic POSIX shell plus cat/wc. Encoding defaults to
+auto; structuredContent returns metadata such as bytes, sha256, detected
+encoding, and confidence while the file text is returned in content[0].text.`,
     inputSchema: z.object({
       ...targetFields,
       path: z.string().min(1).describe("Remote file path. Relative paths are joined with root when root is set."),
       max_bytes: z.number().int().positive().default(5 * 1024 * 1024).describe("Maximum file size to read."),
+      encoding: encodingField,
     }).strict(),
     annotations: {
       readOnlyHint: true,
@@ -99,18 +141,26 @@ the remote side only needs a basic POSIX shell plus cat/wc.`,
     root?: string;
     path: string;
     max_bytes?: number;
+    encoding?: string;
   }) => {
     try {
       const path = resolvePath(params.root, params.path);
-      const content = await readTextFile(targetFrom(params), path, params.max_bytes);
+      const decoded = await readTextFileDecoded(targetFrom(params), path, {
+        maxBytes: params.max_bytes,
+        encoding: requestedEncoding(params),
+      });
       const structuredContent = {
         path,
-        content,
-        bytes: Buffer.byteLength(content, "utf8"),
-        sha256: sha256Text(content),
+        bytes: decoded.bytes,
+        sha256: decoded.sha256,
+        encoding: decoded.encoding,
+        requestedEncoding: decoded.requestedEncoding,
+        detectedEncoding: decoded.detectedEncoding,
+        encodingConfidence: decoded.confidence,
+        encodingWarning: decoded.warning,
       };
       return {
-        content: [{ type: "text" as const, text: content }],
+        content: [{ type: "text" as const, text: decoded.text }],
         structuredContent,
       };
     } catch (error) {
@@ -123,11 +173,13 @@ server.registerTool(
   "remote_file_write",
   {
     title: "Write Remote File",
-    description: `Atomically write a UTF-8 text file over SSH or WSL.
+    description: `Atomically write a remote text file over SSH or WSL.
 
 Content is base64-encoded locally and decoded by the remote shell into a temp
 file, then moved into place. Use expected_sha256 when replacing a file that was
-previously read.`,
+previously read. Encoding defaults to auto: new files use UTF-8 and overwrites
+try to preserve the existing file's detected encoding. Small writes can fall
+back to POSIX printf when base64 is unavailable.`,
     inputSchema: z.object({
       ...targetFields,
       path: z.string().min(1).describe("Remote file path. Relative paths are joined with root when root is set."),
@@ -136,6 +188,7 @@ previously read.`,
       create_parents: z.boolean().default(true).describe("Create parent directories before writing."),
       expected_sha256: z.string().optional().describe("Optional sha256 of the current remote file before writing."),
       mode: z.string().optional().describe('Optional chmod mode for the written file, e.g. "644".'),
+      encoding: encodingField,
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -157,23 +210,28 @@ previously read.`,
     create_parents?: boolean;
     expected_sha256?: string;
     mode?: string;
+    encoding?: string;
   }) => {
     try {
       const path = resolvePath(params.root, params.path);
-      const result = await writeTextFile(targetFrom(params), {
+      const target = targetFrom(params);
+      const overwrite = params.overwrite ?? true;
+      const writeEncoding = await resolveWriteEncoding(target, path, params, overwrite);
+      const result = await writeTextFile(target, {
         path,
         content: params.content,
-        overwrite: params.overwrite,
+        overwrite,
         createParents: params.create_parents,
         expectedSha256: params.expected_sha256,
         mode: params.mode,
+        encoding: writeEncoding,
       });
       return {
         content: [{
           type: "text" as const,
           text: `Wrote ${result.bytes} bytes to ${path}\nsha256: ${result.sha256}`,
         }],
-        structuredContent: { path, ...result },
+        structuredContent: { path, ...result, encoding: writeEncoding, requestedEncoding: requestedEncoding(params) },
       };
     } catch (error) {
       return errorResponse(error);
@@ -189,12 +247,15 @@ server.registerTool(
 
 Patch parsing and hunk matching run locally. The remote host only performs
 basic reads and atomic writes. Supported directives: *** Add File and
-*** Update File. Delete and move patches are intentionally unsupported.`,
+*** Update File. Delete and move patches are intentionally unsupported.
+Encoding defaults to auto: updates preserve detected source-file encoding and
+added files use UTF-8 unless encoding is passed explicitly.`,
     inputSchema: z.object({
       ...targetFields,
       patch: z.string().min(1).describe("Patch text using the Codex-style *** Begin Patch format."),
       dry_run: z.boolean().default(false).describe("Compute the patch without writing remote files."),
       max_bytes: z.number().int().positive().default(5 * 1024 * 1024).describe("Maximum size for each file read."),
+      encoding: encodingField,
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -213,9 +274,11 @@ basic reads and atomic writes. Supported directives: *** Add File and
     patch: string;
     dry_run?: boolean;
     max_bytes?: number;
+    encoding?: string;
   }) => {
     try {
       const target = targetFrom(params);
+      const textEncoding = requestedEncoding(params);
       const operations = parsePatch(params.patch);
       const summaries = [];
 
@@ -223,12 +286,14 @@ basic reads and atomic writes. Supported directives: *** Add File and
         const path = resolvePath(params.root, operation.path);
         if (operation.kind === "add") {
           const content = textForAddedFile(operation.lines ?? []);
+          const writeEncoding = isAutoEncoding(textEncoding) ? "utf-8" : textEncoding;
           if (!params.dry_run) {
             await writeTextFile(target, {
               path,
               content,
               overwrite: false,
               createParents: true,
+              encoding: writeEncoding,
             });
           }
           summaries.push({
@@ -236,23 +301,28 @@ basic reads and atomic writes. Supported directives: *** Add File and
             action: "add",
             added: operation.lines?.length ?? 0,
             removed: 0,
-            bytes: Buffer.byteLength(content, "utf8"),
-            sha256: sha256Text(content),
+            bytes: encodeRemoteText(content, writeEncoding).length,
+            sha256: sha256Text(content, writeEncoding),
             dryRun: params.dry_run ?? false,
+            encoding: writeEncoding,
+            requestedEncoding: textEncoding,
           });
           continue;
         }
 
-        const original = await readTextFile(target, path, params.max_bytes);
-        const originalSha256 = sha256Text(original);
-        const applied = applyUpdatePatch(original, operation.hunks ?? [], path);
+        const original = await readTextFileDecoded(target, path, {
+          maxBytes: params.max_bytes,
+          encoding: textEncoding,
+        });
+        const applied = applyUpdatePatch(original.text, operation.hunks ?? [], path);
         if (!params.dry_run) {
           await writeTextFile(target, {
             path,
             content: applied.text,
             overwrite: true,
             createParents: false,
-            expectedSha256: originalSha256,
+            expectedSha256: original.sha256,
+            encoding: original.encoding,
           });
         }
         summaries.push({
@@ -260,10 +330,15 @@ basic reads and atomic writes. Supported directives: *** Add File and
           action: "update",
           added: applied.added,
           removed: applied.removed,
-          bytes: Buffer.byteLength(applied.text, "utf8"),
-          oldSha256: originalSha256,
-          sha256: sha256Text(applied.text),
+          bytes: encodeRemoteText(applied.text, original.encoding).length,
+          oldSha256: original.sha256,
+          sha256: sha256Text(applied.text, original.encoding),
           dryRun: params.dry_run ?? false,
+          encoding: original.encoding,
+          requestedEncoding: textEncoding,
+          detectedEncoding: original.detectedEncoding,
+          encodingConfidence: original.confidence,
+          encodingWarning: original.warning,
         });
       }
 
@@ -286,7 +361,7 @@ server.registerTool(
   "remote_file_list",
   {
     title: "List Remote Directory",
-    description: "List a remote directory over SSH or WSL using basic shell tools.",
+    description: "List a remote directory over SSH or WSL using basic shell tools. Returns compact text plus structured entries.",
     inputSchema: z.object({
       ...targetFields,
       path: z.string().min(1).describe("Remote directory path. Relative paths are joined with root when root is set."),
@@ -327,7 +402,7 @@ server.registerTool(
   "remote_file_stat",
   {
     title: "Stat Remote Path",
-    description: "Inspect a remote path over SSH or WSL.",
+    description: "Inspect a remote path over SSH or WSL. Returns existence, type, size, mode, and mtime when available.",
     inputSchema: z.object({
       ...targetFields,
       path: z.string().min(1).describe("Remote path. Relative paths are joined with root when root is set."),
@@ -365,13 +440,14 @@ server.registerTool(
   "remote_file_search",
   {
     title: "Search Remote Text",
-    description: "Search remote text files over SSH or WSL using grep.",
+    description: "Search remote text files over SSH or WSL using grep. Output is decoded locally with auto/explicit encoding rules; non-ASCII pattern matching depends on the remote grep and locale.",
     inputSchema: z.object({
       ...targetFields,
       path: z.string().min(1).describe("Remote path to search. Relative paths are joined with root when root is set."),
       pattern: z.string().min(1).describe("Search pattern."),
       fixed: z.boolean().default(true).describe("Use fixed-string search instead of grep regex."),
       max_results: z.number().int().positive().default(100).describe("Maximum matching lines to return."),
+      encoding: encodingField,
     }).strict(),
     annotations: {
       readOnlyHint: true,
@@ -391,6 +467,7 @@ server.registerTool(
     pattern: string;
     fixed?: boolean;
     max_results?: number;
+    encoding?: string;
   }) => {
     try {
       const path = resolvePath(params.root, params.path);
@@ -399,10 +476,11 @@ server.registerTool(
         pattern: params.pattern,
         fixed: params.fixed,
         maxResults: params.max_results,
+        encoding: params.encoding,
       });
       return {
         content: [{ type: "text" as const, text: output || "(no matches)" }],
-        structuredContent: { path, output },
+        structuredContent: { path, output, requestedEncoding: requestedEncoding(params) },
       };
     } catch (error) {
       return errorResponse(error);

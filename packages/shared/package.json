@@ -38,5 +38,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "iconv-lite": "^0.6.3",
+    "zod": "^3.23.8"
   }
 }

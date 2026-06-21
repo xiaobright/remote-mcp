@@ -37,6 +37,22 @@ export interface SshRunResult {
   [key: string]: unknown;
 }
 
+export interface SshRawRunResult {
+  target: string;
+  requestedTarget?: string;
+  deviceName?: string;
+  stdout: Buffer;
+  stderr: string;
+  exitCode: number;
+  timedOut?: boolean;
+  timeoutMs?: number;
+  requestedTimeoutMs?: number;
+  timeoutClamped?: boolean;
+  maxTimeoutMs?: number;
+  attemptedTargets?: string[];
+  [key: string]: unknown;
+}
+
 export interface SshState {
   sshCommand: string;
   defaultTarget: string | null;
@@ -613,15 +629,15 @@ export function candidateTargetsFor(target?: string): ResolvedSshTarget[] {
   }));
 }
 
-export async function runSshScript(options: SshRunOptions): Promise<SshRunResult> {
+export async function runSshRawScript(options: SshRunOptions): Promise<SshRawRunResult> {
   const { resolved, args, attemptedTargets } = await buildSshArgsForRun(options);
   const effectiveWorkdir = options.workdir ?? resolved.profile?.defaultWorkdir;
   const input = buildScriptInput(options.script, effectiveWorkdir, options.env);
   const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
 
-  return new Promise<SshRunResult>((resolve, reject) => {
+  return new Promise<SshRawRunResult>((resolve, reject) => {
     const proc = spawn(SSH_COMMAND, args, windowsHiddenSpawnOptions());
-    let stdout = "";
+    const stdout: Buffer[] = [];
     let stderr = "";
     let timedOut = false;
     let settled = false;
@@ -633,7 +649,7 @@ export async function runSshScript(options: SshRunOptions): Promise<SshRunResult
     }, timeout.ms);
     timer.unref();
 
-    proc.stdout?.on("data", (data: Buffer) => { stdout += data.toString(); });
+    proc.stdout?.on("data", (data: Buffer) => { stdout.push(data); });
     proc.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
     proc.on("close", (code) => {
       if (settled) {
@@ -647,7 +663,7 @@ export async function runSshScript(options: SshRunOptions): Promise<SshRunResult
         target: resolved.target,
         requestedTarget: resolved.requestedTarget,
         deviceName: resolved.deviceName,
-        stdout,
+        stdout: Buffer.concat(stdout),
         stderr,
         exitCode: code ?? -1,
         timedOut,
@@ -674,6 +690,14 @@ export async function runSshScript(options: SshRunOptions): Promise<SshRunResult
     proc.stdin?.write(input);
     proc.stdin?.end();
   });
+}
+
+export async function runSshScript(options: SshRunOptions): Promise<SshRunResult> {
+  const result = await runSshRawScript(options);
+  return {
+    ...result,
+    stdout: result.stdout.toString("utf8"),
+  };
 }
 
 export async function startSshTask(options: SshRunOptions): Promise<SshTaskSnapshot> {

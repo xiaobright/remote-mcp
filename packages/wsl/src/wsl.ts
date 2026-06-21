@@ -23,6 +23,18 @@ export interface WslResult {
   [key: string]: unknown;
 }
 
+export interface WslRawResult {
+  stdout: Buffer;
+  stderr: string;
+  exitCode: number;
+  timedOut?: boolean;
+  timeoutMs?: number;
+  requestedTimeoutMs?: number;
+  timeoutClamped?: boolean;
+  maxTimeoutMs?: number;
+  [key: string]: unknown;
+}
+
 export interface WslSessionState {
   running: boolean;
   configuredDistro: string | null;
@@ -427,14 +439,14 @@ export function stopSessionSync(): WslSessionState {
   return stopSessionUnlocked();
 }
 
-async function spawnWslCommand(cmdArgs: string[], input: string, options: WslSyncOptions = {}): Promise<WslResult> {
-  return new Promise<WslResult>((resolve, reject) => {
+async function spawnWslCommandRaw(cmdArgs: string[], input: string, options: WslSyncOptions = {}): Promise<WslRawResult> {
+  return new Promise<WslRawResult>((resolve, reject) => {
     withSessionLock(async () => {
       await startSessionUnlocked();
       const args = wslArgsFor(currentDistro, cmdArgs);
       const proc = spawn(WSL_EXE, args, windowsHiddenSpawnOptions());
       const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
-      let stdout = "";
+      const stdout: Buffer[] = [];
       let stderr = "";
       let timedOut = false;
       let timer: NodeJS.Timeout | null = null;
@@ -446,7 +458,7 @@ async function spawnWslCommand(cmdArgs: string[], input: string, options: WslSyn
       }, timeout.ms);
       timer.unref();
 
-      proc.stdout?.on("data", (data: Buffer) => { stdout += data.toString(); });
+      proc.stdout?.on("data", (data: Buffer) => { stdout.push(data); });
       proc.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
       proc.on("close", (code) => {
         if (settled) {
@@ -457,7 +469,7 @@ async function spawnWslCommand(cmdArgs: string[], input: string, options: WslSyn
           clearTimeout(timer);
         }
         resolve({
-          stdout,
+          stdout: Buffer.concat(stdout),
           stderr,
           exitCode: code ?? -1,
           timedOut,
@@ -483,6 +495,14 @@ async function spawnWslCommand(cmdArgs: string[], input: string, options: WslSyn
   });
 }
 
+async function spawnWslCommand(cmdArgs: string[], input: string, options: WslSyncOptions = {}): Promise<WslResult> {
+  const result = await spawnWslCommandRaw(cmdArgs, input, options);
+  return {
+    ...result,
+    stdout: result.stdout.toString("utf8"),
+  };
+}
+
 export async function execWsl(command: string, workdir?: string, options: WslSyncOptions = {}): Promise<WslResult> {
   return spawnWslCommand(["bash", "-l", "-s"], buildScriptInput(command + "\n", workdir), options);
 }
@@ -494,6 +514,11 @@ export async function execWslScript(
   options: WslSyncOptions = {},
 ): Promise<WslResult> {
   return spawnWslCommand([shell, "-l", "-s"], buildScriptInput(script, workdir), options);
+}
+
+export async function runWslRawScript(script: string, options: WslSyncOptions = {}): Promise<WslRawResult> {
+  const input = buildScriptInput(script.endsWith("\n") ? script : `${script}\n`);
+  return spawnWslCommandRaw(["sh", "-s"], input, options);
 }
 
 async function startWslTask(command: string, shell: string, workdir?: string): Promise<WslTaskSnapshot> {

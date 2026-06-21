@@ -16,6 +16,21 @@ export interface SshRunResult {
     maxTimeoutMs?: number;
     [key: string]: unknown;
 }
+export interface SshRawRunResult {
+    target: string;
+    requestedTarget?: string;
+    deviceName?: string;
+    stdout: Buffer;
+    stderr: string;
+    exitCode: number;
+    timedOut?: boolean;
+    timeoutMs?: number;
+    requestedTimeoutMs?: number;
+    timeoutClamped?: boolean;
+    maxTimeoutMs?: number;
+    attemptedTargets?: string[];
+    [key: string]: unknown;
+}
 export interface SshState {
     sshCommand: string;
     defaultTarget: string | null;
@@ -110,6 +125,7 @@ export declare function getDevice(name: string): SshDeviceProfile;
 export declare function upsertDevice(profile: SshDeviceProfile): SshDeviceProfile;
 export declare function removeDevice(name: string): SshState;
 export declare function candidateTargetsFor(target?: string): ResolvedSshTarget[];
+export declare function runSshRawScript(options: SshRunOptions): Promise<SshRawRunResult>;
 export declare function runSshScript(options: SshRunOptions): Promise<SshRunResult>;
 export declare function startSshTask(options: SshRunOptions): Promise<SshTaskSnapshot>;
 export declare function listTasks(): SshTaskSnapshot[];

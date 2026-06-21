@@ -10,6 +10,17 @@ export interface WslResult {
     maxTimeoutMs?: number;
     [key: string]: unknown;
 }
+export interface WslRawResult {
+    stdout: Buffer;
+    stderr: string;
+    exitCode: number;
+    timedOut?: boolean;
+    timeoutMs?: number;
+    requestedTimeoutMs?: number;
+    timeoutClamped?: boolean;
+    maxTimeoutMs?: number;
+    [key: string]: unknown;
+}
 export interface WslSessionState {
     running: boolean;
     configuredDistro: string | null;
@@ -73,6 +84,7 @@ export declare function stopSession(): Promise<WslSessionState>;
 export declare function stopSessionSync(): WslSessionState;
 export declare function execWsl(command: string, workdir?: string, options?: WslSyncOptions): Promise<WslResult>;
 export declare function execWslScript(script: string, shell?: string, workdir?: string, options?: WslSyncOptions): Promise<WslResult>;
+export declare function runWslRawScript(script: string, options?: WslSyncOptions): Promise<WslRawResult>;
 export declare function execWslAsync(command: string, workdir?: string): Promise<WslTaskSnapshot>;
 export declare function execWslScriptAsync(script: string, shell?: string, workdir?: string): Promise<WslTaskSnapshot>;
 export declare function listTasks(): WslTaskSnapshot[];
