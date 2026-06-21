@@ -7,8 +7,6 @@ remote world they actually need:
 
 - `@remote-mcp/ssh`: SSH command/script/task/profile plus SSH file tools.
 - `@remote-mcp/wsl`: WSL command/script/task/session plus WSL file tools.
-- `@remote-mcp/remote-fs`: compatibility server for the older transport-selecting
-  remote file tools.
 - `@remote-mcp/shared`: internal shared code for process spawning, MCP helpers,
   async task management, shell quoting, patch parsing, and remote file ops.
 
@@ -53,25 +51,13 @@ SSH:
 - `ssh_file_stat`
 - `ssh_file_search`
 
-Compatibility:
-
-- `remote_file_read`
-- `remote_file_write`
-- `remote_file_apply_patch`
-- `remote_file_list`
-- `remote_file_stat`
-- `remote_file_search`
-
-The compatibility tools still take `transport: "wsl" | "ssh"`. Prefer the
-transport-specific `wsl_file_*` and `ssh_file_*` tools for new configurations.
-
 ## Return Shape
 
 Tool results use MCP's `content` plus `structuredContent` shape. Human-readable
 or directly consumable text is returned in `content`; stable machine-readable
-metadata is returned in `structuredContent`. File reads return the file text only
-in `content[0].text`, while `structuredContent` carries path, bytes, sha256,
-encoding, detectedEncoding, and encodingConfidence.
+metadata is returned in `structuredContent`. File reads return a short summary
+in `content[0].text`; the full file text is in `structuredContent.text` with
+path, bytes, sha256, encoding, detectedEncoding, and encodingConfidence.
 
 ## Build
 
@@ -85,5 +71,4 @@ npm run build
 ```powershell
 node packages/ssh/dist/index.js
 node packages/wsl/dist/index.js
-node packages/remote-fs/dist/index.js
 ```

@@ -1,5 +1,9 @@
 import { z, type ZodRawShape } from "zod";
-import { errorResponse } from "../mcp.js";
+import {
+  errorResponse,
+  rejectUnexpectedParams,
+  requireStringParam,
+} from "../mcp.js";
 import { joinRemotePath } from "../shell.js";
 import {
   applyUpdatePatch,
@@ -138,6 +142,12 @@ function commonFields(options: RegisterRemoteFileToolsOptions): ZodRawShape {
 
 export function registerRemoteFileTools(options: RegisterRemoteFileToolsOptions): Record<string, RemoteFileToolHandler> {
   const common = commonFields(options);
+  const commonKeys = Object.keys(common);
+  const readParams = [...commonKeys, "path", "max_bytes", "encoding"];
+  const writeParams = [...commonKeys, "path", "content", "create_parents", "overwrite", "expected_sha256", "mode", "encoding"];
+  const patchParams = [...commonKeys, "patch", "dry_run", "max_bytes", "encoding"];
+  const pathParams = [...commonKeys, "path"];
+  const searchParams = [...commonKeys, "path", "pattern", "fixed", "max_results", "encoding"];
   const handlers: Record<string, RemoteFileToolHandler> = {};
 
   function register(
@@ -176,8 +186,10 @@ clients that surface both content and structuredContent.`,
     },
     async (params) => {
       try {
+        const toolName = `${options.prefix}_read`;
+        rejectUnexpectedParams(params, readParams, toolName);
         const runner = options.makeRunner(params);
-        const path = resolvePath(params.root, String(params.path ?? ""));
+        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
         const decoded = await readTextFileDecoded(runner, path, {
           maxBytes: maxBytes(params),
           encoding: requestedEncoding(params),
@@ -233,13 +245,15 @@ available on a slim remote device.`,
     },
     async (params) => {
       try {
+        const toolName = `${options.prefix}_write`;
+        rejectUnexpectedParams(params, writeParams, toolName);
         const runner = options.makeRunner(params);
-        const path = resolvePath(params.root, String(params.path ?? ""));
+        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
         const overwrite = typeof params.overwrite === "boolean" ? params.overwrite : true;
         const writeEncoding = await resolveWriteEncoding(runner, path, params, overwrite);
         const result = await writeTextFile(runner, {
           path,
-          content: String(params.content ?? ""),
+          content: requireStringParam(params, "content", toolName, { allowEmpty: true }),
           createParents: typeof params.create_parents === "boolean" ? params.create_parents : true,
           overwrite,
           expectedSha256: typeof params.expected_sha256 === "string" ? params.expected_sha256 : undefined,
@@ -288,9 +302,15 @@ while added files are written as UTF-8 unless encoding is passed explicitly.`,
     },
     async (params) => {
       try {
+        const toolName = `${options.prefix}_apply_patch`;
+        rejectUnexpectedParams(params, patchParams, toolName, {
+          command: `${toolName} expects "patch" containing a Codex-style patch, not "command".`,
+          content: `${toolName} expects "patch" containing a Codex-style patch, not "content".`,
+          script: `${toolName} expects "patch" containing a Codex-style patch, not "script".`,
+        });
         const runner = options.makeRunner(params);
         const textEncoding = requestedEncoding(params);
-        const operations = parsePatch(String(params.patch ?? ""));
+        const operations = parsePatch(requireStringParam(params, "patch", toolName));
         const summaries = [];
 
         for (const operation of operations) {
@@ -392,7 +412,9 @@ structured entries with name, type, size, and mtime when available.`,
     },
     async (params) => {
       try {
-        const path = resolvePath(params.root, String(params.path ?? ""));
+        const toolName = `${options.prefix}_list`;
+        rejectUnexpectedParams(params, pathParams, toolName);
+        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
         const entries = await listDir(options.makeRunner(params), path);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(entries, null, 2) }],
@@ -425,7 +447,9 @@ can obtain them.`,
     },
     async (params) => {
       try {
-        const path = resolvePath(params.root, String(params.path ?? ""));
+        const toolName = `${options.prefix}_stat`;
+        rejectUnexpectedParams(params, pathParams, toolName);
+        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
         const info = await statPath(options.makeRunner(params), path);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(info, null, 2) }],
@@ -463,10 +487,12 @@ non-ASCII pattern matching still depends on the remote grep and locale.`,
     },
     async (params) => {
       try {
-        const path = resolvePath(params.root, String(params.path ?? ""));
+        const toolName = `${options.prefix}_search`;
+        rejectUnexpectedParams(params, searchParams, toolName);
+        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
         const output = await searchText(options.makeRunner(params), {
           path,
-          pattern: String(params.pattern ?? ""),
+          pattern: requireStringParam(params, "pattern", toolName),
           fixed: fixedSearch(params),
           maxResults: maxResults(params),
           encoding: encoding(params),

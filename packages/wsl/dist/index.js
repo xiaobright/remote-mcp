@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { asRecord, errorResponse, optionalNumber, optionalString, taskTailChars, } from "@remote-mcp/shared/mcp";
+import { asRecord, errorResponse, optionalNumber, optionalString, rejectUnexpectedParams, requireStringParam, } from "@remote-mcp/shared/mcp";
 import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
 import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, runWslRawScript, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, } from "./wsl.js";
 const server = new McpServer({
@@ -231,6 +231,35 @@ function optionalRunMode(value) {
 function optionalTimeoutBehavior(value) {
     return value === "kill" || value === "detach" ? value : undefined;
 }
+const wslExecParams = [
+    "command",
+    "mode",
+    "on_timeout",
+    "tail_chars",
+    "timeout_ms",
+    "workdir",
+];
+const wslScriptParams = [
+    "mode",
+    "on_timeout",
+    "script",
+    "shell",
+    "tail_chars",
+    "timeout_ms",
+    "workdir",
+];
+const wslSessionParams = [
+    "action",
+    "distro",
+];
+const wslTaskParams = [
+    "action",
+    "stderrOffset",
+    "stdoutOffset",
+    "tail_chars",
+    "taskId",
+    "wait_ms",
+];
 async function dispatchToolCall(name, argsInput) {
     const args = asRecord(argsInput);
     const fileHandler = wslFileToolHandlers[name];
@@ -239,22 +268,29 @@ async function dispatchToolCall(name, argsInput) {
     }
     switch (name) {
         case "wsl_session":
+            rejectUnexpectedParams(args, wslSessionParams, "wsl_session");
             return handleSessionAction({
-                action: String(args.action ?? ""),
+                action: requireStringParam(args, "action", "wsl_session"),
                 distro: optionalString(args.distro),
             });
         case "wsl_task":
+            rejectUnexpectedParams(args, wslTaskParams, "wsl_task", {
+                tailChars: 'wsl_task expects "tail_chars"; camelCase "tailChars" is not supported.',
+            });
             return handleTaskAction({
-                action: String(args.action ?? ""),
+                action: requireStringParam(args, "action", "wsl_task"),
                 taskId: optionalString(args.taskId),
                 waitMs: optionalNumber(args.wait_ms),
                 stdoutOffset: optionalNumber(args.stdoutOffset),
                 stderrOffset: optionalNumber(args.stderrOffset),
-                tailChars: taskTailChars(args),
+                tailChars: optionalNumber(args.tail_chars),
             });
         case "wsl_exec":
+            rejectUnexpectedParams(args, wslExecParams, "wsl_exec", {
+                script: 'wsl_exec expects "command"; use wsl_script when you want the parameter to be named "script".',
+            });
             return runCommandTool({
-                command: String(args.command ?? ""),
+                command: requireStringParam(args, "command", "wsl_exec"),
                 workdir: optionalString(args.workdir),
                 mode: optionalRunMode(args.mode),
                 timeout_ms: optionalNumber(args.timeout_ms),
@@ -262,8 +298,11 @@ async function dispatchToolCall(name, argsInput) {
                 tail_chars: optionalNumber(args.tail_chars),
             });
         case "wsl_script":
+            rejectUnexpectedParams(args, wslScriptParams, "wsl_script", {
+                command: 'wsl_script expects "script"; use wsl_exec when you want the parameter to be named "command".',
+            });
             return runScriptTool({
-                script: String(args.script ?? ""),
+                script: requireStringParam(args, "script", "wsl_script"),
                 shell: optionalString(args.shell),
                 workdir: optionalString(args.workdir),
                 mode: optionalRunMode(args.mode),
@@ -271,57 +310,6 @@ async function dispatchToolCall(name, argsInput) {
                 on_timeout: optionalTimeoutBehavior(args.on_timeout),
                 tail_chars: optionalNumber(args.tail_chars),
             });
-        // Hidden compatibility aliases. They are intentionally not registered, so
-        // tools/list only exposes the consolidated tool surface.
-        case "wsl_start":
-            return handleSessionAction({ action: "start", distro: optionalString(args.distro) });
-        case "wsl_stop":
-            return handleSessionAction({ action: "stop" });
-        case "wsl_status":
-            return handleSessionAction({ action: "status" });
-        case "wsl_set_distro":
-            return handleSessionAction({ action: "set_distro", distro: optionalString(args.distro) });
-        case "wsl_list_distros":
-            return handleSessionAction({ action: "list_distros" });
-        case "wsl_get_distro": {
-            const current = getDistro();
-            return {
-                content: [{
-                        type: "text",
-                        text: current
-                            ? `Configured distro: ${current} (startup default: ${getDefaultDistro()})`
-                            : `Using the system default WSL distro (startup default: ${getDefaultDistro()})`,
-                    }],
-                structuredContent: { distro: current, defaultDistro: getDefaultDistro() },
-            };
-        }
-        case "wsl_exec_async":
-            return runCommandTool({
-                command: String(args.command ?? ""),
-                workdir: optionalString(args.workdir),
-                mode: "async",
-            });
-        case "wsl_script_async":
-            return runScriptTool({
-                script: String(args.script ?? ""),
-                shell: optionalString(args.shell),
-                workdir: optionalString(args.workdir),
-                mode: "async",
-            });
-        case "wsl_task_status":
-            return handleTaskAction({ action: "status", taskId: optionalString(args.taskId) });
-        case "wsl_task_output":
-            return handleTaskAction({
-                action: "output",
-                taskId: optionalString(args.taskId),
-                stdoutOffset: optionalNumber(args.stdoutOffset),
-                stderrOffset: optionalNumber(args.stderrOffset),
-                tailChars: taskTailChars(args),
-            });
-        case "wsl_task_cancel":
-            return handleTaskAction({ action: "cancel", taskId: optionalString(args.taskId) });
-        case "wsl_task_list":
-            return handleTaskAction({ action: "list" });
         default:
             return {
                 content: [{ type: "text", text: `Error: Tool ${name} not found` }],
@@ -363,8 +351,7 @@ Actions:
   - list_distros: list installed WSL distributions.
 
 Use only this public session tool for WSL session state. Session state is owned
-by this MCP process; do not invent separate wsl_status/wsl_start/wsl_stop tool
-calls from older examples.`,
+by this MCP process.`,
     inputSchema: z.object({
         action: z.enum(["status", "start", "stop", "set_distro", "list_distros"]),
         distro: z.string()
@@ -443,7 +430,7 @@ poll interval is reached, then returns a warning plus the real result.`,
         return await handleTaskAction({
             ...params,
             waitMs: params.wait_ms,
-            tailChars: params.tail_chars ?? params.tailChars,
+            tailChars: params.tail_chars,
         });
     }
     catch (error) {
@@ -480,7 +467,7 @@ Args:
   - tail_chars: for watch output, return only the tail of each stream.
 
 Parameter names intentionally match ssh_exec/ssh_script. Start background work by
-passing mode="async" here; do not invent separate wsl_exec_async tool calls.
+passing mode="async" here.
 
 Returns:
   sync: { stdout, stderr, exitCode, timedOut?, timeoutMs? }
@@ -563,7 +550,7 @@ Args:
   - tail_chars: for watch output, return only the tail of each stream.
 
 Parameter names intentionally match ssh_exec/ssh_script. Start background work by
-passing mode="async" here; do not invent separate wsl_script_async tool calls.
+passing mode="async" here.
 
 Returns:
   Same as wsl_exec: sync command result, async task snapshot, or watch output.

@@ -26,7 +26,31 @@ export function optionalStringRecord(value) {
         ? record
         : undefined;
 }
-export function taskTailChars(params) {
-    return optionalNumber(params.tail_chars) ?? optionalNumber(params.tailChars);
+export function rejectUnexpectedParams(params, allowed, toolName, hints = {}) {
+    const allowedSet = new Set(allowed);
+    const unexpected = Object.keys(params).filter((key) => !allowedSet.has(key));
+    if (unexpected.length === 0) {
+        return;
+    }
+    const hintText = unexpected
+        .map((key) => hints[key])
+        .filter((hint) => Boolean(hint))
+        .join(" ");
+    const allowedText = [...allowedSet].sort().join(", ");
+    throw new Error([
+        `${toolName}: unexpected parameter(s): ${unexpected.join(", ")}.`,
+        hintText,
+        `Allowed parameters: ${allowedText}.`,
+    ].filter(Boolean).join(" "));
+}
+export function requireStringParam(params, key, toolName, options = {}) {
+    const value = params[key];
+    if (typeof value !== "string") {
+        throw new Error(`${toolName}: parameter "${key}" is required and must be a string.`);
+    }
+    if (!options.allowEmpty && value.trim().length === 0) {
+        throw new Error(`${toolName}: parameter "${key}" is required and must not be empty.`);
+    }
+    return value;
 }
 //# sourceMappingURL=mcp.js.map

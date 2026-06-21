@@ -19,7 +19,7 @@ export function parsePatch(input) {
             continue;
         }
         if (line.startsWith("*** Delete File:")) {
-            throw new Error("Delete File patches are intentionally not supported by remote_file_apply_patch.");
+            throw new Error("Delete File patches are intentionally not supported by remote apply_patch tools.");
         }
         if (line.startsWith("*** Add File:")) {
             const path = parseFilePath(line, "*** Add File:");

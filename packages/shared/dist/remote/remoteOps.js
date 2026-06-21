@@ -216,7 +216,7 @@ function parseTextOptions(maxBytesOrOptions, encoding) {
 }
 function octalWriteFallback(bytes, destination) {
     if (bytes.length > OCTAL_FALLBACK_LIMIT) {
-        return `printf 'remote_file_write: base64 command is required for files larger than ${OCTAL_FALLBACK_LIMIT} bytes\\n' >&2
+        return `printf 'remote_write: base64 command is required for files larger than ${OCTAL_FALLBACK_LIMIT} bytes\\n' >&2
 exit 77`;
     }
     if (bytes.length === 0) {
@@ -252,16 +252,16 @@ export async function readFileBytes(target, path, maxBytesOrOptions) {
 path=${shellQuote(path)}
 max_bytes=${options.maxBytes}
 if [ ! -e "$path" ]; then
-  printf 'remote_file_read: not found: %s\\n' "$path" >&2
+  printf 'remote_read: not found: %s\\n' "$path" >&2
   exit 66
 fi
 if [ -d "$path" ]; then
-  printf 'remote_file_read: is a directory: %s\\n' "$path" >&2
+  printf 'remote_read: is a directory: %s\\n' "$path" >&2
   exit 67
 fi
 size=$(wc -c < "$path" 2>/dev/null | tr -d ' ' || printf 0)
 if [ "$size" -gt "$max_bytes" ]; then
-  printf 'remote_file_read: file exceeds max_bytes: %s > %s\\n' "$size" "$max_bytes" >&2
+  printf 'remote_read: file exceeds max_bytes: %s > %s\\n' "$size" "$max_bytes" >&2
   exit 78
 fi
 cat "$path"
@@ -300,23 +300,23 @@ if [ ${createParents ? "1" : "0"} -eq 1 ]; then
   mkdir -p "$dir"
 fi
 if [ ${overwrite ? "0" : "1"} -eq 1 ] && [ -e "$path" ]; then
-  printf 'remote_file_write: refusing to overwrite existing path: %s\\n' "$path" >&2
+  printf 'remote_write: refusing to overwrite existing path: %s\\n' "$path" >&2
   exit 73
 fi
 expected=${shellQuote(expectedSha)}
 existing_mode=
 if [ -n "$expected" ]; then
   if [ ! -e "$path" ]; then
-    printf 'remote_file_write: expected existing file for sha256 check: %s\\n' "$path" >&2
+    printf 'remote_write: expected existing file for sha256 check: %s\\n' "$path" >&2
     exit 74
   fi
   if ! command -v sha256sum >/dev/null 2>&1; then
-    printf 'remote_file_write: sha256sum is required for expected_sha256 checks\\n' >&2
+    printf 'remote_write: sha256sum is required for expected_sha256 checks\\n' >&2
     exit 75
   fi
   set -- $(sha256sum "$path")
   if [ "$1" != "$expected" ]; then
-    printf 'remote_file_write: sha256 mismatch for %s\\nexpected: %s\\nactual:   %s\\n' "$path" "$expected" "$1" >&2
+    printf 'remote_write: sha256 mismatch for %s\\nexpected: %s\\nactual:   %s\\n' "$path" "$expected" "$1" >&2
     exit 76
   fi
 fi
@@ -396,7 +396,7 @@ export async function listDir(target, path) {
     const script = `set -eu
 path=${shellQuote(path)}
 if [ ! -d "$path" ]; then
-  printf 'remote_file_list: not a directory: %s\\n' "$path" >&2
+  printf 'remote_list: not a directory: %s\\n' "$path" >&2
   exit 68
 fi
 for p in "$path"/* "$path"/.[!.]* "$path"/..?*; do
@@ -438,13 +438,13 @@ export async function searchText(target, options) {
 path=${shellQuote(options.path)}
 pattern=${shellQuote(options.pattern)}
 if [ ! -e "$path" ]; then
-  printf 'remote_file_search: not found: %s\\n' "$path" >&2
+  printf 'remote_search: not found: %s\\n' "$path" >&2
   exit 69
 fi
 if command -v grep >/dev/null 2>&1; then
   grep -RIn${fixedFlag} "$pattern" "$path" 2>/dev/null | head -n ${Math.max(1, Math.floor(maxResults))} || true
 else
-  printf 'remote_file_search: grep command is required on the remote host\\n' >&2
+  printf 'remote_search: grep command is required on the remote host\\n' >&2
   exit 70
 fi
 `;

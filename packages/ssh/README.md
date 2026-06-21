@@ -45,11 +45,7 @@ Task parameter names intentionally match `wsl_task`:
 - `stdoutOffset` / `stderrOffset` for offset reads.
 - `tail_chars` for task output tailing.
 
-Older `tailChars` task calls are still accepted for compatibility, but new calls
-should use `tail_chars`.
-
-There are no public `ssh_exec_async` or `ssh_script_async` tools. Use
-`ssh_exec` / `ssh_script` with `mode="async"`.
+Use `ssh_exec` / `ssh_script` with `mode="async"` for background work.
 
 Prefer `mode="sync"` for normal commands and long builds/tests when there is no
 other foreground work to do. Use `mode="async"` only when true background

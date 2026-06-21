@@ -4,13 +4,14 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/shared",
+    "packages/ssh",
+    "packages/wsl"
   ],
   "scripts": {
-    "build": "npm --workspace @remote-mcp/shared run build && npm --workspace @remote-mcp/ssh run build && npm --workspace @remote-mcp/wsl run build && npm --workspace @remote-mcp/remote-fs run build",
+    "build": "npm --workspace @remote-mcp/shared run build && npm --workspace @remote-mcp/ssh run build && npm --workspace @remote-mcp/wsl run build",
     "start:ssh": "npm --workspace @remote-mcp/ssh start",
-    "start:wsl": "npm --workspace @remote-mcp/wsl start",
-    "start:remote-fs": "npm --workspace @remote-mcp/remote-fs start"
+    "start:wsl": "npm --workspace @remote-mcp/wsl start"
   },
   "engines": {
     "node": ">=18"

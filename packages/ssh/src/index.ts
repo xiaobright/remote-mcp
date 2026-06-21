@@ -12,7 +12,8 @@ import {
   optionalString,
   optionalStringArray,
   optionalStringRecord,
-  taskTailChars,
+  rejectUnexpectedParams,
+  requireStringParam,
 } from "@remote-mcp/shared/mcp";
 import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
 import {
@@ -130,6 +131,59 @@ function optionalRunMode(value: unknown): SshRunMode | undefined {
 function optionalTimeoutBehavior(value: unknown): SshTimeoutBehavior | undefined {
   return value === "kill" || value === "detach" ? value : undefined;
 }
+
+const sshExecParams = [
+  "command",
+  "env",
+  "login",
+  "mode",
+  "on_timeout",
+  "shell",
+  "ssh_options",
+  "tail_chars",
+  "target",
+  "timeout_ms",
+  "workdir",
+];
+
+const sshScriptParams = [
+  "env",
+  "login",
+  "mode",
+  "on_timeout",
+  "script",
+  "shell",
+  "ssh_options",
+  "tail_chars",
+  "target",
+  "timeout_ms",
+  "workdir",
+];
+
+const sshProfileParams = [
+  "action",
+  "defaultWorkdir",
+  "host",
+  "hosts",
+  "identityFile",
+  "name",
+  "notes",
+  "port",
+  "ssh_options",
+  "tags",
+  "target",
+  "timeout_ms",
+  "user",
+];
+
+const sshTaskParams = [
+  "action",
+  "stderrOffset",
+  "stdoutOffset",
+  "tail_chars",
+  "taskId",
+  "wait_ms",
+];
 
 async function handleProfileAction(params: {
   action: string;
@@ -372,8 +426,9 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
 
   switch (name) {
     case "ssh_profile":
+      rejectUnexpectedParams(args, sshProfileParams, "ssh_profile");
       return handleProfileAction({
-        action: String(args.action ?? ""),
+        action: requireStringParam(args, "action", "ssh_profile"),
         target: optionalString(args.target),
         name: optionalString(args.name),
         user: optionalString(args.user),
@@ -388,18 +443,24 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
         timeout_ms: optionalNumber(args.timeout_ms),
       });
     case "ssh_task":
+      rejectUnexpectedParams(args, sshTaskParams, "ssh_task", {
+        tailChars: 'ssh_task expects "tail_chars"; camelCase "tailChars" is not supported.',
+      });
       return handleTaskAction({
-        action: String(args.action ?? ""),
+        action: requireStringParam(args, "action", "ssh_task"),
         taskId: optionalString(args.taskId),
         waitMs: optionalNumber(args.wait_ms),
         stdoutOffset: optionalNumber(args.stdoutOffset),
         stderrOffset: optionalNumber(args.stderrOffset),
-        tailChars: taskTailChars(args),
+        tailChars: optionalNumber(args.tail_chars),
       });
     case "ssh_exec":
+      rejectUnexpectedParams(args, sshExecParams, "ssh_exec", {
+        script: 'ssh_exec expects "command"; use ssh_script when you want the parameter to be named "script".',
+      });
       return runScriptTool({
         target: optionalString(args.target),
-        script: String(args.command ?? ""),
+        script: requireStringParam(args, "command", "ssh_exec"),
         shell: optionalString(args.shell),
         login: optionalBoolean(args.login),
         workdir: optionalString(args.workdir),
@@ -411,9 +472,12 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
         tail_chars: optionalNumber(args.tail_chars),
       });
     case "ssh_script":
+      rejectUnexpectedParams(args, sshScriptParams, "ssh_script", {
+        command: 'ssh_script expects "script"; use ssh_exec when you want the parameter to be named "command".',
+      });
       return runScriptTool({
         target: optionalString(args.target),
-        script: String(args.script ?? ""),
+        script: requireStringParam(args, "script", "ssh_script"),
         shell: optionalString(args.shell),
         login: optionalBoolean(args.login),
         workdir: optionalString(args.workdir),
@@ -424,45 +488,6 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
         on_timeout: optionalTimeoutBehavior(args.on_timeout),
         tail_chars: optionalNumber(args.tail_chars),
       });
-
-    // Hidden compatibility aliases. They are intentionally not registered, so
-    // tools/list only exposes the consolidated tool surface.
-    case "ssh_exec_async":
-      return runScriptTool({
-        target: optionalString(args.target),
-        script: String(args.command ?? ""),
-        shell: optionalString(args.shell),
-        login: optionalBoolean(args.login),
-        workdir: optionalString(args.workdir),
-        env: optionalStringRecord(args.env),
-        ssh_options: optionalStringArray(args.ssh_options),
-        mode: "async",
-      });
-    case "ssh_script_async":
-      return runScriptTool({
-        target: optionalString(args.target),
-        script: String(args.script ?? ""),
-        shell: optionalString(args.shell),
-        login: optionalBoolean(args.login),
-        workdir: optionalString(args.workdir),
-        env: optionalStringRecord(args.env),
-        ssh_options: optionalStringArray(args.ssh_options),
-        mode: "async",
-      });
-    case "ssh_task_status":
-      return handleTaskAction({ action: "status", taskId: optionalString(args.taskId) });
-    case "ssh_task_output":
-      return handleTaskAction({
-        action: "output",
-        taskId: optionalString(args.taskId),
-        stdoutOffset: optionalNumber(args.stdoutOffset),
-        stderrOffset: optionalNumber(args.stderrOffset),
-        tailChars: taskTailChars(args),
-      });
-    case "ssh_task_cancel":
-      return handleTaskAction({ action: "cancel", taskId: optionalString(args.taskId) });
-    case "ssh_task_list":
-      return handleTaskAction({ action: "list" });
     default:
       return {
         content: [{ type: "text" as const, text: `Error: Tool ${name} not found` }],
@@ -640,13 +665,12 @@ real result.`,
     stdoutOffset?: number;
     stderrOffset?: number;
     tail_chars?: number;
-    tailChars?: number;
   }) => {
     try {
       return await handleTaskAction({
         ...params,
         waitMs: params.wait_ms,
-        tailChars: taskTailChars(params),
+        tailChars: params.tail_chars,
       });
     } catch (error) {
       return errorResponse(error);
@@ -688,9 +712,9 @@ Args:
 
 Parameter names intentionally match wsl_exec/wsl_script. Prefer sync mode for
 ordinary commands and long builds/tests when there is no other work to do. Start
-background work by passing mode="async" here only when necessary; do not invent
-separate ssh_exec_async tool calls. For complex commands, use ssh_script instead
-of local PowerShell/cmd ssh command-line composition.
+background work by passing mode="async" here only when necessary. For complex
+commands, use ssh_script instead of local PowerShell/cmd ssh command-line
+composition.
 
 Returns:
   sync: { target, stdout, stderr, exitCode, timedOut?, timeoutMs? }
@@ -810,8 +834,7 @@ Args:
 
 Parameter names intentionally match wsl_exec/wsl_script. Prefer sync mode for
 ordinary commands and long builds/tests when there is no other work to do. Start
-background work by passing mode="async" here only when necessary; do not invent
-separate ssh_script_async tool calls.
+background work by passing mode="async" here only when necessary.
 
 Returns:
   Same as ssh_exec: sync command result, async task snapshot, or watch output.
