@@ -108,6 +108,27 @@ function maxResults(params: Record<string, unknown>): number {
   return typeof params.max_results === "number" ? params.max_results : 100;
 }
 
+function formatReadSummary(path: string, decoded: {
+  bytes: number;
+  sha256: string;
+  encoding: string;
+  requestedEncoding: string;
+  detectedEncoding: string;
+  confidence: number;
+  warning?: string;
+}): string {
+  const lines = [
+    `Read ${decoded.bytes} bytes from ${path}`,
+    `sha256: ${decoded.sha256}`,
+    `encoding: ${decoded.encoding} (requested: ${decoded.requestedEncoding}, detected: ${decoded.detectedEncoding}, confidence: ${decoded.confidence})`,
+    "text: structuredContent.text",
+  ];
+  if (decoded.warning) {
+    lines.push(`warning: ${decoded.warning}`);
+  }
+  return lines.join("\n");
+}
+
 function commonFields(options: RegisterRemoteFileToolsOptions): ZodRawShape {
   return {
     ...(options.targetFields ?? {}),
@@ -137,8 +158,9 @@ export function registerRemoteFileTools(options: RegisterRemoteFileToolsOptions)
 The remote side only needs a basic POSIX shell plus cat/wc. File bytes are read
 raw and decoded locally. Encoding defaults to auto: UTF-8 is preferred when
 valid, and common legacy encodings such as GBK/GB18030 are tried when UTF-8 is
-invalid. The returned text content is in content[0].text; structuredContent
-contains metadata such as bytes, sha256, detected encoding, and confidence.`,
+invalid. The returned text content is in structuredContent.text. The text
+content entry is a short summary to avoid duplicating large file contents for
+clients that surface both content and structuredContent.`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -161,9 +183,10 @@ contains metadata such as bytes, sha256, detected encoding, and confidence.`,
           encoding: requestedEncoding(params),
         });
         return {
-          content: [{ type: "text" as const, text: decoded.text }],
+          content: [{ type: "text" as const, text: formatReadSummary(path, decoded) }],
           structuredContent: {
             path,
+            text: decoded.text,
             bytes: decoded.bytes,
             sha256: decoded.sha256,
             encoding: decoded.encoding,

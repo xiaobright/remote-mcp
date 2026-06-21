@@ -109,6 +109,27 @@ async function resolveWriteEncoding(
   return decoded.encoding;
 }
 
+function formatReadSummary(path: string, decoded: {
+  bytes: number;
+  sha256: string;
+  encoding: string;
+  requestedEncoding: string;
+  detectedEncoding: string;
+  confidence: number;
+  warning?: string;
+}): string {
+  const lines = [
+    `Read ${decoded.bytes} bytes from ${path}`,
+    `sha256: ${decoded.sha256}`,
+    `encoding: ${decoded.encoding} (requested: ${decoded.requestedEncoding}, detected: ${decoded.detectedEncoding}, confidence: ${decoded.confidence})`,
+    "text: structuredContent.text",
+  ];
+  if (decoded.warning) {
+    lines.push(`warning: ${decoded.warning}`);
+  }
+  return lines.join("\n");
+}
+
 server.registerTool(
   "remote_file_read",
   {
@@ -118,7 +139,9 @@ server.registerTool(
 This is for observation. It does not require Python or Node on the remote host;
 the remote side only needs a basic POSIX shell plus cat/wc. Encoding defaults to
 auto; structuredContent returns metadata such as bytes, sha256, detected
-encoding, and confidence while the file text is returned in content[0].text.`,
+encoding, and confidence plus text. The text content entry is a short summary
+to avoid duplicating large file contents for clients that surface both content
+and structuredContent.`,
     inputSchema: z.object({
       ...targetFields,
       path: z.string().min(1).describe("Remote file path. Relative paths are joined with root when root is set."),
@@ -152,6 +175,7 @@ encoding, and confidence while the file text is returned in content[0].text.`,
       const structuredContent = {
         path,
         bytes: decoded.bytes,
+        text: decoded.text,
         sha256: decoded.sha256,
         encoding: decoded.encoding,
         requestedEncoding: decoded.requestedEncoding,
@@ -160,7 +184,7 @@ encoding, and confidence while the file text is returned in content[0].text.`,
         encodingWarning: decoded.warning,
       };
       return {
-        content: [{ type: "text" as const, text: decoded.text }],
+        content: [{ type: "text" as const, text: formatReadSummary(path, decoded) }],
         structuredContent,
       };
     } catch (error) {
