@@ -7,6 +7,7 @@ export interface PatchOperation {
 
 export interface PatchHunk {
   lines: PatchLine[];
+  patchLine?: number;
 }
 
 export interface PatchLine {
@@ -14,10 +15,35 @@ export interface PatchLine {
   text: string;
 }
 
+export interface PatchNormalization {
+  patchLine: number;
+  path: string;
+  directive: string;
+  assumed: "context";
+  reason: "empty-line" | "missing-marker";
+  text: string;
+}
+
+export interface PatchApplyWarning {
+  kind: "ambiguous-match" | "empty-old-block";
+  path: string;
+  hunk: number;
+  patchLine?: number;
+  message: string;
+  matches?: number;
+  firstOldLine?: string;
+}
+
+export interface ParsePatchResult {
+  operations: PatchOperation[];
+  normalizations: PatchNormalization[];
+}
+
 export interface AppliedPatch {
   text: string;
   added: number;
   removed: number;
+  warnings: PatchApplyWarning[];
 }
 
 function parseFilePath(line: string, prefix: string): string {
@@ -28,9 +54,24 @@ function parseFilePath(line: string, prefix: string): string {
   return path;
 }
 
-export function parsePatch(input: string): PatchOperation[] {
+function hasEdits(lines: PatchLine[]): boolean {
+  return lines.some((line) => line.op === "add" || line.op === "remove");
+}
+
+function pushHunk(hunks: PatchHunk[], lines: PatchLine[], path: string, patchLine?: number): void {
+  if (lines.length === 0) {
+    return;
+  }
+  if (!hasEdits(lines)) {
+    throw new Error(`Update File hunk for ${path} starting at patch line ${patchLine ?? "(unknown)"} has no additions or removals. If you meant to add or remove lines, prefix them with '+' or '-'.`);
+  }
+  hunks.push({ lines, patchLine });
+}
+
+export function parsePatch(input: string): ParsePatchResult {
   const lines = input.replace(/\r\n/g, "\n").split("\n");
   const operations: PatchOperation[] = [];
+  const normalizations: PatchNormalization[] = [];
   let index = 0;
 
   if (lines[index] === "*** Begin Patch") {
@@ -69,14 +110,16 @@ export function parsePatch(input: string): PatchOperation[] {
       index++;
       const hunks: PatchHunk[] = [];
       let current: PatchLine[] = [];
+      let currentPatchLine: number | undefined;
+      const directive = `Update File: ${path}`;
 
       while (index < lines.length && !lines[index].startsWith("*** ")) {
         const currentLine = lines[index];
+        const patchLine = index + 1;
         if (currentLine.startsWith("@@")) {
-          if (current.length > 0) {
-            hunks.push({ lines: current });
-            current = [];
-          }
+          pushHunk(hunks, current, path, currentPatchLine);
+          current = [];
+          currentPatchLine = undefined;
           index++;
           continue;
         }
@@ -84,6 +127,7 @@ export function parsePatch(input: string): PatchOperation[] {
           index++;
           continue;
         }
+        currentPatchLine ??= patchLine;
         const marker = currentLine[0];
         if (marker === " ") {
           current.push({ op: "context", text: currentLine.slice(1) });
@@ -92,15 +136,29 @@ export function parsePatch(input: string): PatchOperation[] {
         } else if (marker === "-") {
           current.push({ op: "remove", text: currentLine.slice(1) });
         } else if (currentLine.length === 0) {
-          throw new Error("Empty patch lines must include a leading patch marker.");
+          normalizations.push({
+            patchLine,
+            path,
+            directive,
+            assumed: "context",
+            reason: "empty-line",
+            text: "",
+          });
+          current.push({ op: "context", text: "" });
         } else {
-          throw new Error(`Unsupported patch line: ${currentLine}`);
+          normalizations.push({
+            patchLine,
+            path,
+            directive,
+            assumed: "context",
+            reason: "missing-marker",
+            text: currentLine,
+          });
+          current.push({ op: "context", text: currentLine });
         }
         index++;
       }
-      if (current.length > 0) {
-        hunks.push({ lines: current });
-      }
+      pushHunk(hunks, current, path, currentPatchLine);
       if (hunks.length === 0) {
         throw new Error(`Update File patch has no hunks: ${path}`);
       }
@@ -114,7 +172,7 @@ export function parsePatch(input: string): PatchOperation[] {
   if (operations.length === 0) {
     throw new Error("Patch contains no supported file operations.");
   }
-  return operations;
+  return { operations, normalizations };
 }
 
 function splitText(text: string): { lines: string[]; trailingNewline: boolean } {
@@ -152,20 +210,62 @@ function findSubsequence(haystack: string[], needle: string[], fromIndex: number
   return -1;
 }
 
+function countSubsequenceMatches(haystack: string[], needle: string[], fromIndex: number, limit = 2): number {
+  if (needle.length === 0) {
+    return Math.min(limit, Math.max(0, haystack.length - fromIndex + 1));
+  }
+
+  let matches = 0;
+  let index = fromIndex;
+  while (index <= haystack.length - needle.length) {
+    const foundAt = findSubsequence(haystack, needle, index);
+    if (foundAt < 0) {
+      break;
+    }
+    matches += 1;
+    if (matches >= limit) {
+      return matches;
+    }
+    index = foundAt + 1;
+  }
+  return matches;
+}
+
 export function applyUpdatePatch(original: string, hunks: PatchHunk[], path: string): AppliedPatch {
   const split = splitText(original);
   let lines = split.lines;
   let searchIndex = 0;
   let added = 0;
   let removed = 0;
+  const warnings: PatchApplyWarning[] = [];
 
-  for (const hunk of hunks) {
+  for (const [hunkIndex, hunk] of hunks.entries()) {
     const oldLines = hunk.lines
       .filter((line) => line.op === "context" || line.op === "remove")
       .map((line) => line.text);
     const newLines = hunk.lines
       .filter((line) => line.op === "context" || line.op === "add")
       .map((line) => line.text);
+
+    if (oldLines.length === 0) {
+      warnings.push({
+        kind: "empty-old-block",
+        path,
+        hunk: hunkIndex + 1,
+        patchLine: hunk.patchLine,
+        message: `Patch hunk ${hunkIndex + 1} for ${path} has no context or removed lines; insertion uses the current search position.`,
+      });
+    } else if (countSubsequenceMatches(lines, oldLines, searchIndex, 2) > 1) {
+      warnings.push({
+        kind: "ambiguous-match",
+        path,
+        hunk: hunkIndex + 1,
+        patchLine: hunk.patchLine,
+        message: `Patch hunk ${hunkIndex + 1} for ${path} matched more than one location; the first match after the current search position was used.`,
+        matches: 2,
+        firstOldLine: oldLines[0],
+      });
+    }
 
     const foundAt = findSubsequence(lines, oldLines, searchIndex);
     if (foundAt < 0) {
@@ -186,6 +286,7 @@ export function applyUpdatePatch(original: string, hunks: PatchHunk[], path: str
     text: joinText(lines, split.trailingNewline),
     added,
     removed,
+    warnings,
   };
 }
 

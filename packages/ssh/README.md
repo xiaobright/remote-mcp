@@ -26,6 +26,16 @@ escaping traps while keeping remote state predictable.
     and anything more complex than one line.
 - `ssh_task`
   - Manage async/watch tasks started by `ssh_exec` or `ssh_script`.
+- `ssh_file_edit`
+  - Replace exact text in one remote file.
+  - Defaults to one unique match; pass `replace_all=true` to replace every match.
+  - Also accepts `oldString`/`newString`/`replaceAll` aliases for clients whose
+    native edit tool uses camelCase.
+- `ssh_file_apply_patch`
+  - Apply Codex-style multi-file patches and add files.
+  - Blank or unmarked hunk lines are treated as context and reported in
+    `structuredContent.normalizations`.
+  - Hunks with no additions or removals are rejected to catch missing markers.
 
 ## Execution Parameters
 

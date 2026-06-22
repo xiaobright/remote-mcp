@@ -19,6 +19,14 @@ the caller to pass `encoding` explicitly. Patch updates preserve the detected
 source-file encoding. Small writes can fall back to POSIX `printf` when a slim
 remote device lacks `base64`.
 
+For focused one-file replacements, use `*_file_edit`: it takes
+`old_string`/`new_string`, requires a unique match by default, and supports
+`replace_all=true` when every match should be changed. `*_file_apply_patch`
+remains the multi-file/multi-hunk/new-file tool. Its Codex-style patch parser is
+slightly tolerant of blank or unmarked context lines, but reports each
+normalization in `structuredContent.normalizations` and rejects hunks with no
+actual additions or removals.
+
 The shared package is not loaded by clients directly; it keeps behavior
 consistent across the separate servers while allowing each server to be enabled
 or disabled on its own.
@@ -33,6 +41,7 @@ WSL:
 - `wsl_task`
 - `wsl_file_read`
 - `wsl_file_write`
+- `wsl_file_edit`
 - `wsl_file_apply_patch`
 - `wsl_file_list`
 - `wsl_file_stat`
@@ -46,6 +55,7 @@ SSH:
 - `ssh_task`
 - `ssh_file_read`
 - `ssh_file_write`
+- `ssh_file_edit`
 - `ssh_file_apply_patch`
 - `ssh_file_list`
 - `ssh_file_stat`
