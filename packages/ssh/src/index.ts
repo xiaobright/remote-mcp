@@ -520,7 +520,7 @@ Actions:
   - get_device: show one saved profile by name.
   - upsert_device: create/update a profile.
   - remove_device: delete a saved profile.
-  - set_default: set this MCP process's default target, e.g. rock5a or radxa@192.168.31.34.
+  - set_default: set this MCP process's default target, e.g. devbox or user@example.com.
   - clear_default: clear default target.
   - test: run a small read-only probe on the target/device, trying saved hosts in order.
 
@@ -533,10 +533,10 @@ state; use ssh_exec/ssh_script for execution and ssh_task for async/watch tasks.
         .describe("Device profile name for get_device/upsert_device/remove_device, e.g. rock5a."),
       target: z.string()
         .optional()
-        .describe("SSH target or device name, for example rock5a, radxa@192.168.31.34, or a Host alias from ~/.ssh/config."),
+        .describe("SSH target or device name, for example devbox, user@example.com, or a Host alias from ~/.ssh/config."),
       user: z.string()
         .optional()
-        .describe("Device username for upsert_device, e.g. radxa."),
+        .describe("Device username for upsert_device, e.g. alice."),
       host: z.string()
         .optional()
         .describe("Primary host/IP for upsert_device."),
@@ -724,9 +724,9 @@ Returns:
 Examples:
   - command="ls -la /home"                            -> list remote home directory
   - command="uname -a"                                -> short remote command
-  - target="rock5a" + command="uptime"                -> saved device profile
-  - target="radxa@192.168.31.34" + command="uptime"   -> explicit target
-  - workdir="/home/radxa/Desktop/project" + command="npm test"
+  - target="devbox" + command="uptime"                -> saved device profile
+  - target="user@example.com" + command="uptime"      -> explicit target
+  - workdir="/home/alice/project" + command="npm test"
   - mode="watch", timeout_ms=120000 for builds that may take a while
 
 Error Handling:

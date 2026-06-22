@@ -2,6 +2,12 @@
   "name": "remote-mcp",
   "version": "0.1.0",
   "private": true,
+  "description": "Transport-focused MCP servers for SSH and WSL command execution plus agent-friendly remote file editing.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaobright/remote-mcp.git"
+  },
   "type": "module",
   "workspaces": [
     "packages/shared",

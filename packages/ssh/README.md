@@ -86,23 +86,22 @@ Example profile:
 {
   "version": 1,
   "devices": {
-    "rock5a": {
-      "name": "rock5a",
-      "user": "radxa",
+    "devbox": {
+      "name": "devbox",
+      "user": "alice",
       "hosts": [
-        "192.168.31.34",
-        "192.168.137.42",
-        "10.42.0.23"
+        "devbox.local",
+        "10.0.0.42"
       ],
-      "identityFile": "C:/Users/y2278/.ssh/id_ed25519",
-      "defaultWorkdir": "/home/radxa/Desktop/project",
-      "tags": ["rk3588", "devboard"]
+      "identityFile": "C:/Users/alice/.ssh/id_ed25519",
+      "defaultWorkdir": "/home/alice/project",
+      "tags": ["linux", "devbox"]
     }
   }
 }
 ```
 
-Then tool calls can use `target="rock5a"` instead of `radxa@192.168...`. When a
+Then tool calls can use `target="devbox"` instead of `alice@devbox.local`. When a
 device has multiple hosts, `ssh_profile test`, `ssh_exec`, and `ssh_script` try
 the remembered last successful target first, then saved target/host/hosts. A
 successful connection updates `lastResolvedTarget` and `lastSeen`.
@@ -112,10 +111,10 @@ Example `ssh_profile upsert_device` arguments:
 ```json
 {
   "action": "upsert_device",
-  "name": "rock5a",
-  "user": "radxa",
-  "hosts": ["192.168.31.34", "192.168.137.42"],
-  "defaultWorkdir": "/home/radxa/Desktop/project"
+  "name": "devbox",
+  "user": "alice",
+  "hosts": ["devbox.local", "10.0.0.42"],
+  "defaultWorkdir": "/home/alice/project"
 }
 ```
 
@@ -127,7 +126,7 @@ setup, run the password step in a real terminal, then let the MCP verify.
 PowerShell equivalent of `ssh-copy-id`:
 
 ```powershell
-Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh radxa@192.168.31.34 "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh alice@devbox.local "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
 ```
 
 After that, use:
@@ -140,19 +139,19 @@ ssh_profile action="test" target="rock5a"
 
 ```toml
 [mcp_servers.ssh]
-command = 'C:\Users\y2278\AppData\Local\OpenAI\Codex\bin\5b9024f90663758b\node.exe'
-args = ['C:\Users\y2278\.config\opencode\ssh-mcp-server\dist\index.js']
+command = 'node'
+args = ['C:\path\to\remote-mcp\packages\ssh\dist\index.js']
 startup_timeout_sec = 30
 
 [mcp_servers.ssh.env]
-SSH_MCP_DEFAULT_TARGET = "radxa@192.168.31.34"
+SSH_MCP_DEFAULT_TARGET = "alice@devbox.local"
 SSH_MCP_BATCH_MODE = "1"
 SSH_MCP_STRICT_HOST_KEY_CHECKING = "accept-new"
 ```
 
 ## Environment
 
-- `SSH_MCP_DEFAULT_TARGET`: default SSH target, e.g. `radxa@192.168.31.34`.
+- `SSH_MCP_DEFAULT_TARGET`: default SSH target, e.g. `alice@devbox.local`.
 - `SSH_MCP_COMMAND`: override the ssh executable path. Default: `ssh`.
 - `SSH_MCP_DEFAULT_SHELL`: remote shell. Default: `bash`.
 - `SSH_MCP_OPTIONS_JSON`: full default ssh argv override as JSON string array.

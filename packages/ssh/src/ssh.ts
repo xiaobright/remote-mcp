@@ -428,7 +428,7 @@ function buildScriptInput(script: string, workdir?: string, env?: Record<string,
 function resolveTarget(target?: string): ResolvedSshTarget {
   const requested = target?.trim() || currentDefaultTarget;
   if (!requested) {
-    throw new Error("target is required. Pass target like radxa@192.168.31.34 or set SSH_MCP_DEFAULT_TARGET.");
+    throw new Error("target is required. Pass target like user@example.com or set SSH_MCP_DEFAULT_TARGET.");
   }
   const profile = deviceProfile(requested);
   if (!profile) {
