@@ -1,10 +1,27 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv } from "@remote-mcp/shared/env";
 import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
 import { buildWorkdirPreamble } from "@remote-mcp/shared/shell";
 import {
+  buildPersistentJobCancelScript,
+  buildPersistentJobInspectScript,
+  buildPersistentJobRunnerScript,
+  getPersistentJob,
+  listPersistentJobs as listPersistentJobsFromStore,
+  parsePersistentJobInspect,
+  resolveDefaultPersistentJobStorePath,
+  touchPersistentJob,
+  upsertPersistentJob,
+  type PersistentJobReadMode,
+  type PersistentJobRecord,
+} from "@remote-mcp/shared/persistentJobs";
+import {
   ProcessTaskManager,
+  type TaskReadMode,
   type TaskOutput,
   type TaskSnapshot,
   type TaskState,
@@ -45,6 +62,7 @@ export interface WslSessionState {
 }
 
 export type WslTaskState = TaskState;
+export type WslReadMode = TaskReadMode;
 
 export interface WslTaskMeta {
   command: string;
@@ -75,6 +93,7 @@ export interface WslTaskOutputOptions {
   stdoutOffset?: number;
   stderrOffset?: number;
   tailChars?: number;
+  readMode?: WslReadMode;
 }
 
 export interface WslTaskWaitResult extends TaskWaitResult<WslTaskMeta> {
@@ -101,11 +120,18 @@ const DEFAULT_DISTRO = process.env.WSL_MCP_DEFAULT_DISTRO?.trim() || "Ubuntu-24.
 const TASK_OUTPUT_LIMIT = readPositiveIntEnv("WSL_MCP_TASK_OUTPUT_LIMIT", 1048576);
 const MAX_FINISHED_TASKS = readPositiveIntEnv("WSL_MCP_MAX_FINISHED_TASKS", 100);
 const TASK_MIN_POLL_INTERVAL_MS = readPositiveIntEnv("WSL_MCP_MIN_POLL_INTERVAL_MS", 20000);
+const TASK_DEFAULT_READ_WINDOW_CHARS = readPositiveIntEnv("WSL_MCP_DEFAULT_TASK_READ_WINDOW_CHARS", 8192);
 const DEFAULT_SYNC_TIMEOUT_MS = readPositiveIntEnv("WSL_MCP_DEFAULT_SYNC_TIMEOUT_MS", 120000);
 const DEFAULT_WATCH_TIMEOUT_MS = readPositiveIntEnv("WSL_MCP_DEFAULT_WATCH_TIMEOUT_MS", 120000);
 const DEFAULT_TASK_WAIT_MS = readPositiveIntEnv("WSL_MCP_DEFAULT_TASK_WAIT_MS", 30000);
 const MAX_TOOL_TIMEOUT_MS = readPositiveIntEnv("WSL_MCP_MAX_TOOL_TIMEOUT_MS", 540000);
 const PROTECT_MNT_DELETE = process.env.WSL_MCP_PROTECT_MNT_DELETE !== "0";
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const PERSISTENT_JOB_STORE_PATH = resolveDefaultPersistentJobStorePath(MODULE_DIR);
+const PERSISTENT_JOB_MAX_RUNTIME_MS = readPositiveIntEnv("WSL_MCP_PERSISTENT_JOB_MAX_RUNTIME_MS", 3600000);
+const PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS = readPositiveIntEnv("WSL_MCP_PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS", 8192);
+const PERSISTENT_JOB_OP_TIMEOUT_MS = readPositiveIntEnv("WSL_MCP_PERSISTENT_JOB_OP_TIMEOUT_MS", 30000);
+const PERSISTENT_JOB_POLL_INTERVAL_MS = readPositiveIntEnv("WSL_MCP_PERSISTENT_JOB_POLL_INTERVAL_MS", 1000);
 
 let keepalive: ChildProcess | null = null;
 let currentDistro: string | null = DEFAULT_DISTRO;
@@ -118,6 +144,7 @@ const taskManager = new ProcessTaskManager<WslTaskMeta>({
   minPollIntervalMs: TASK_MIN_POLL_INTERVAL_MS,
   pollRecommendation: "Use wsl_task action=\"wait\" for long-running tasks instead of rapid status/output polling.",
   unknownTaskLabel: "WSL",
+  defaultReadWindowChars: TASK_DEFAULT_READ_WINDOW_CHARS,
 });
 
 async function withSessionLock<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -566,8 +593,9 @@ export function readTaskOutput(
   stdoutOffset?: number,
   stderrOffset?: number,
   tailChars?: number,
+  readMode?: WslReadMode,
 ): WslTaskOutput {
-  return taskManager.readOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
+  return taskManager.readOutput(taskId, { stdoutOffset, stderrOffset, tailChars, readMode });
 }
 
 export async function observeTaskStatus(taskId: string): Promise<WslTaskSnapshot> {
@@ -579,8 +607,9 @@ export async function observeTaskOutput(
   stdoutOffset?: number,
   stderrOffset?: number,
   tailChars?: number,
+  readMode?: WslReadMode,
 ): Promise<WslTaskOutput> {
-  return taskManager.observeOutput(taskId, { stdoutOffset, stderrOffset, tailChars });
+  return taskManager.observeOutput(taskId, { stdoutOffset, stderrOffset, tailChars, readMode });
 }
 
 export async function waitTask(
@@ -589,7 +618,10 @@ export async function waitTask(
   options: WslTaskOutputOptions = {},
 ): Promise<WslTaskWaitResult> {
   const wait = boundedDuration(waitMs, DEFAULT_TASK_WAIT_MS);
-  const output = await taskManager.wait(taskId, wait.ms, options);
+  const output = await taskManager.wait(taskId, wait.ms, {
+    ...options,
+    readMode: options.readMode ?? "delta",
+  });
   return {
     ...output,
     waitMs: wait.ms,
@@ -618,7 +650,13 @@ export async function watchWslTask(
   }
 
   const finalOutput = killed
-    ? readTaskOutput(task.taskId, outputOptions.stdoutOffset, outputOptions.stderrOffset, outputOptions.tailChars)
+    ? readTaskOutput(
+      task.taskId,
+      outputOptions.stdoutOffset,
+      outputOptions.stderrOffset,
+      outputOptions.tailChars,
+      outputOptions.readMode,
+    )
     : waitResult;
 
   return {
@@ -657,4 +695,368 @@ export async function listDistros(): Promise<string[]> {
     });
     proc.on("error", reject);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Persistent jobs: detached tasks that survive MCP/Codex restarts.
+//
+// Unlike attached tasks (ProcessTaskManager), persistent jobs run fully
+// detached inside WSL via setsid. Logs and pid files live in the WSL home
+// directory (~/.remote-mcp/jobs/<jobId>/); job metadata lives in the Windows
+// side store (work/persistent-jobs.json). Any agent that knows the jobId can
+// re-attach, read logs, or cancel — even across MCP restarts.
+// ---------------------------------------------------------------------------
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function jobDirFor(jobId: string): string {
+  return `$HOME/.remote-mcp/jobs/${jobId}`;
+}
+
+function parseIntOrNull(value: string | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const num = Number.parseInt(value, 10);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parsePidPair(stdout: string): { pgid: number | null; runnerPid: number | null } {
+  const [pgidLine, runnerPidLine] = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^\d+$/.test(line));
+  return {
+    pgid: parseIntOrNull(pgidLine),
+    runnerPid: parseIntOrNull(runnerPidLine),
+  };
+}
+
+function requireWslJob(jobId: string): PersistentJobRecord {
+  const record = getPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId);
+  if (record.backend !== "wsl") {
+    throw new Error(`Persistent job ${jobId} is not a WSL job (backend=${record.backend}).`);
+  }
+  return record;
+}
+
+/**
+ * Runs a short WSL command without the session lock or keepalive. Used for all
+ * persistent job control/read operations so they never compete with attached
+ * task locking and can target a detached job's files independently.
+ */
+async function spawnWslOnce(cmdArgs: string[], input: string, timeoutMs = PERSISTENT_JOB_OP_TIMEOUT_MS): Promise<WslResult> {
+  return new Promise<WslResult>((resolve, reject) => {
+    const proc = spawn(WSL_EXE, wslArgsFor(currentDistro, cmdArgs), windowsHiddenSpawnOptions());
+    const stdout: Buffer[] = [];
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill();
+    }, timeoutMs);
+    timer.unref();
+    proc.stdout?.on("data", (data: Buffer) => { stdout.push(data); });
+    proc.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
+    proc.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr,
+        exitCode: code ?? -1,
+        timedOut,
+      });
+    });
+    proc.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    proc.stdin?.write(input);
+    proc.stdin?.end();
+  });
+}
+
+async function execWslScriptForDistro(
+  script: string,
+  distro: string | null | undefined,
+  shell = "bash",
+  timeoutMs = PERSISTENT_JOB_OP_TIMEOUT_MS,
+): Promise<WslResult> {
+  const input = buildScriptInput(script.endsWith("\n") ? script : `${script}\n`);
+  return spawnWslOnceForDistro(distro, [shell, "-l", "-s"], input, timeoutMs);
+}
+
+async function execWslForDistro(
+  command: string,
+  distro: string | null | undefined,
+  timeoutMs = PERSISTENT_JOB_OP_TIMEOUT_MS,
+): Promise<WslResult> {
+  const input = buildScriptInput(command.endsWith("\n") ? command : `${command}\n`);
+  return spawnWslOnceForDistro(distro, ["bash", "-l", "-s"], input, timeoutMs);
+}
+
+async function spawnWslOnceForDistro(
+  distro: string | null | undefined,
+  cmdArgs: string[],
+  input: string,
+  timeoutMs = PERSISTENT_JOB_OP_TIMEOUT_MS,
+): Promise<WslResult> {
+  return new Promise<WslResult>((resolve, reject) => {
+    const proc = spawn(WSL_EXE, wslArgsFor(typeof distro === "undefined" ? currentDistro : distro, cmdArgs), windowsHiddenSpawnOptions());
+    const stdout: Buffer[] = [];
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill();
+    }, timeoutMs);
+    timer.unref();
+    proc.stdout?.on("data", (data: Buffer) => { stdout.push(data); });
+    proc.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
+    proc.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr,
+        exitCode: code ?? -1,
+        timedOut,
+      });
+    });
+    proc.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    proc.stdin?.write(input);
+    proc.stdin?.end();
+  });
+}
+
+export interface WslPersistentJobOutput {
+  job: PersistentJobRecord;
+  stdout: string;
+  stderr: string;
+  stdoutOffset: number;
+  stderrOffset: number;
+  nextStdoutOffset: number;
+  nextStderrOffset: number;
+  stdoutLength: number;
+  stderrLength: number;
+  readMode: PersistentJobReadMode;
+  [key: string]: unknown;
+}
+
+async function readPersistentJobPids(jobId: string, distro: string | null | undefined): Promise<{
+  pgid: number | null;
+  runnerPid: number | null;
+}> {
+  const command = `cat "$HOME/.remote-mcp/jobs/${jobId}/pgid" 2>/dev/null; printf '\\n'; cat "$HOME/.remote-mcp/jobs/${jobId}/runner.pid" 2>/dev/null`;
+  const deadline = Date.now() + 2000;
+  let latest = { pgid: null as number | null, runnerPid: null as number | null };
+
+  while (Date.now() <= deadline) {
+    const result = await execWslForDistro(command, distro);
+    latest = parsePidPair(result.stdout);
+    if (latest.pgid !== null || latest.runnerPid !== null) {
+      return latest;
+    }
+    await delay(100);
+  }
+
+  return latest;
+}
+
+export async function startPersistentJob(options: {
+  command: string;
+  workdir?: string;
+  maxRuntimeMs?: number;
+}): Promise<PersistentJobRecord> {
+  const jobId = randomUUID();
+  const maxRuntimeMs = options.maxRuntimeMs ?? PERSISTENT_JOB_MAX_RUNTIME_MS;
+  const commandB64 = Buffer.from(options.command, "utf8").toString("base64");
+  const workdirB64 = options.workdir ? Buffer.from(options.workdir, "utf8").toString("base64") : "";
+  const runnerScript = buildPersistentJobRunnerScript({ jobId, commandB64, workdirB64, maxRuntimeMs });
+  await ensureSessionStarted();
+  const configuredDistro = currentDistro;
+  const startResult = await execWslScriptForDistro(runnerScript, configuredDistro);
+  if (startResult.exitCode !== 0) {
+    throw new Error(`Failed to start persistent job ${jobId}: ${startResult.stderr.trim() || `wsl.exe exited with code ${startResult.exitCode}`}`);
+  }
+
+  // Read back the pgid and runner.pid written by the runner script.
+  const { pgid, runnerPid } = await readPersistentJobPids(jobId, configuredDistro);
+  const startedAt = nowIso();
+  const deadlineIso = maxRuntimeMs > 0 ? new Date(Date.now() + maxRuntimeMs).toISOString() : null;
+  const jobDir = jobDirFor(jobId);
+  const record: PersistentJobRecord = {
+    jobId,
+    backend: "wsl",
+    state: "running",
+    shell: "bash",
+    workdir: options.workdir,
+    configuredDistro,
+    jobDir,
+    bodyPath: `${jobDir}/cmd.sh`,
+    stdoutPath: `${jobDir}/stdout.log`,
+    stderrPath: `${jobDir}/stderr.log`,
+    statusPath: `${jobDir}/status`,
+    runnerPid,
+    pgid,
+    maxRuntimeMs,
+    deadlineIso,
+    startedAt,
+    endedAt: null,
+    exitCode: null,
+    error: null,
+    createdAt: startedAt,
+    updatedAt: startedAt,
+  };
+  return upsertPersistentJob(PERSISTENT_JOB_STORE_PATH, record);
+}
+
+export async function getPersistentJobStatus(jobId: string): Promise<PersistentJobRecord> {
+  const record = requireWslJob(jobId);
+  if (record.state === "running" && record.deadlineIso && new Date(record.deadlineIso).getTime() <= Date.now()) {
+    const refreshed = await refreshPersistentJobRecord(record);
+    if (refreshed.state === "running") {
+      await cancelPersistentJob(jobId);
+      return touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, { state: "expired", endedAt: nowIso() });
+    }
+    return refreshed;
+  }
+  if (record.state !== "running" && record.state !== "starting") {
+    return record;
+  }
+  return refreshPersistentJobRecord(record);
+}
+
+async function refreshPersistentJobRecord(record: PersistentJobRecord): Promise<PersistentJobRecord> {
+  const script = buildPersistentJobInspectScript({
+    jobId: record.jobId,
+    readMode: "delta",
+    maxChars: 0,
+    includeContent: false,
+  });
+  const result = await execWslScriptForDistro(script, record.configuredDistro);
+  const inspect = parsePersistentJobInspect(result.stdout);
+  const patch: Partial<PersistentJobRecord> = { state: inspect.state };
+  if (inspect.state === "exited") {
+    patch.endedAt = nowIso();
+    patch.exitCode = parseIntOrNull(inspect.statusContent);
+  } else if (inspect.state === "error") {
+    patch.endedAt = nowIso();
+    patch.error = inspect.statusContent || "unknown error";
+  } else if (inspect.state === "cancelled" || inspect.state === "expired") {
+    patch.endedAt = nowIso();
+  }
+  return touchPersistentJob(PERSISTENT_JOB_STORE_PATH, record.jobId, patch);
+}
+
+export async function readPersistentJobOutput(
+  jobId: string,
+  options: {
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    tailChars?: number;
+    readMode?: PersistentJobReadMode;
+  } = {},
+): Promise<WslPersistentJobOutput> {
+  const record = requireWslJob(jobId);
+  const readMode = options.readMode ?? "delta";
+  const script = buildPersistentJobInspectScript({
+    jobId,
+    readMode,
+    stdoutOffset: options.stdoutOffset,
+    stderrOffset: options.stderrOffset,
+    tailChars: options.tailChars,
+    maxChars: PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS,
+    includeContent: true,
+  });
+  const result = await execWslScriptForDistro(script, record.configuredDistro);
+  const inspect = parsePersistentJobInspect(result.stdout);
+  const stdout = inspect.stdoutB64 ? Buffer.from(inspect.stdoutB64, "base64").toString("utf8") : "";
+  const stderr = inspect.stderrB64 ? Buffer.from(inspect.stderrB64, "base64").toString("utf8") : "";
+
+  // Refresh terminal state into the record if the job just finished.
+  let fresh = record;
+  if (inspect.state !== "running" && inspect.state !== "starting" && record.state === "running") {
+    const patch: Partial<PersistentJobRecord> = { state: inspect.state, endedAt: nowIso() };
+    if (inspect.state === "exited") {
+      patch.exitCode = parseIntOrNull(inspect.statusContent);
+    } else if (inspect.state === "error") {
+      patch.error = inspect.statusContent || "unknown error";
+    }
+    fresh = touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, patch);
+  }
+  return {
+    job: fresh,
+    stdout,
+    stderr,
+    stdoutOffset: inspect.stdoutOffset,
+    stderrOffset: inspect.stderrOffset,
+    nextStdoutOffset: inspect.stdoutNextOffset,
+    nextStderrOffset: inspect.stderrNextOffset,
+    stdoutLength: inspect.stdoutLength,
+    stderrLength: inspect.stderrLength,
+    readMode,
+  };
+}
+
+export async function waitPersistentJob(
+  jobId: string,
+  waitMs: number,
+  options: {
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    tailChars?: number;
+    readMode?: PersistentJobReadMode;
+  } = {},
+): Promise<WslPersistentJobOutput & { completed: boolean; timedOut: boolean; waitedMs: number }> {
+  const started = Date.now();
+  while (true) {
+    const status = await getPersistentJobStatus(jobId);
+    if (status.state !== "running" && status.state !== "starting") {
+      const output = await readPersistentJobOutput(jobId, options);
+      return { ...output, completed: true, timedOut: false, waitedMs: Date.now() - started };
+    }
+    const elapsed = Date.now() - started;
+    if (elapsed >= waitMs) {
+      const output = await readPersistentJobOutput(jobId, options);
+      return { ...output, completed: false, timedOut: true, waitedMs: elapsed };
+    }
+    await delay(Math.min(PERSISTENT_JOB_POLL_INTERVAL_MS, Math.max(0, waitMs - elapsed)));
+  }
+}
+
+export async function cancelPersistentJob(jobId: string): Promise<PersistentJobRecord> {
+  const record = requireWslJob(jobId);
+  const script = buildPersistentJobCancelScript(jobId);
+  await execWslScriptForDistro(script, record.configuredDistro);
+  return touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, {
+    state: "cancelled",
+    endedAt: nowIso(),
+  });
+}
+
+export function listPersistentJobs(): PersistentJobRecord[] {
+  return listPersistentJobsFromStore(PERSISTENT_JOB_STORE_PATH);
 }

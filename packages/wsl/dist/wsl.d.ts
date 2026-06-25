@@ -1,4 +1,5 @@
-import { type TaskOutput, type TaskSnapshot, type TaskState, type TaskWaitResult } from "@remote-mcp/shared/task-manager";
+import { type PersistentJobReadMode, type PersistentJobRecord } from "@remote-mcp/shared/persistentJobs";
+import { type TaskReadMode, type TaskOutput, type TaskSnapshot, type TaskState, type TaskWaitResult } from "@remote-mcp/shared/task-manager";
 export interface WslResult {
     stdout: string;
     stderr: string;
@@ -30,6 +31,7 @@ export interface WslSessionState {
     [key: string]: unknown;
 }
 export type WslTaskState = TaskState;
+export type WslReadMode = TaskReadMode;
 export interface WslTaskMeta {
     command: string;
     shell: string;
@@ -54,6 +56,7 @@ export interface WslTaskOutputOptions {
     stdoutOffset?: number;
     stderrOffset?: number;
     tailChars?: number;
+    readMode?: WslReadMode;
 }
 export interface WslTaskWaitResult extends TaskWaitResult<WslTaskMeta> {
     waitMs: number;
@@ -89,12 +92,49 @@ export declare function execWslAsync(command: string, workdir?: string): Promise
 export declare function execWslScriptAsync(script: string, shell?: string, workdir?: string): Promise<WslTaskSnapshot>;
 export declare function listTasks(): WslTaskSnapshot[];
 export declare function getTaskStatus(taskId: string): WslTaskSnapshot;
-export declare function readTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number): WslTaskOutput;
+export declare function readTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number, readMode?: WslReadMode): WslTaskOutput;
 export declare function observeTaskStatus(taskId: string): Promise<WslTaskSnapshot>;
-export declare function observeTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number): Promise<WslTaskOutput>;
+export declare function observeTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number, readMode?: WslReadMode): Promise<WslTaskOutput>;
 export declare function waitTask(taskId: string, waitMs?: number, options?: WslTaskOutputOptions): Promise<WslTaskWaitResult>;
 export declare function watchWslTask(command: string, shell: string, workdir?: string, timeoutMs?: number, timeoutBehavior?: WslTimeoutBehavior, outputOptions?: WslTaskOutputOptions): Promise<WslWatchResult>;
 export declare function cancelTask(taskId: string): WslTaskSnapshot;
 export declare function cancelAllTasksSync(): void;
 export declare function listDistros(): Promise<string[]>;
+export interface WslPersistentJobOutput {
+    job: PersistentJobRecord;
+    stdout: string;
+    stderr: string;
+    stdoutOffset: number;
+    stderrOffset: number;
+    nextStdoutOffset: number;
+    nextStderrOffset: number;
+    stdoutLength: number;
+    stderrLength: number;
+    readMode: PersistentJobReadMode;
+    [key: string]: unknown;
+}
+export declare function startPersistentJob(options: {
+    command: string;
+    workdir?: string;
+    maxRuntimeMs?: number;
+}): Promise<PersistentJobRecord>;
+export declare function getPersistentJobStatus(jobId: string): Promise<PersistentJobRecord>;
+export declare function readPersistentJobOutput(jobId: string, options?: {
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    tailChars?: number;
+    readMode?: PersistentJobReadMode;
+}): Promise<WslPersistentJobOutput>;
+export declare function waitPersistentJob(jobId: string, waitMs: number, options?: {
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    tailChars?: number;
+    readMode?: PersistentJobReadMode;
+}): Promise<WslPersistentJobOutput & {
+    completed: boolean;
+    timedOut: boolean;
+    waitedMs: number;
+}>;
+export declare function cancelPersistentJob(jobId: string): Promise<PersistentJobRecord>;
+export declare function listPersistentJobs(): PersistentJobRecord[];
 //# sourceMappingURL=wsl.d.ts.map

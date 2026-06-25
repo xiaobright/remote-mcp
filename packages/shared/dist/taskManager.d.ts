@@ -1,5 +1,6 @@
 import { type ChildProcess } from "node:child_process";
 export type TaskState = "running" | "exited" | "error" | "cancelled";
+export type TaskReadMode = "delta" | "full";
 export interface TaskSnapshotBase {
     taskId: string;
     state: TaskState;
@@ -26,12 +27,14 @@ export interface TaskOutput<TMeta extends object> {
     nextStderrOffset: number;
     stdoutTruncated: boolean;
     stderrTruncated: boolean;
+    readMode: TaskReadMode;
     [key: string]: unknown;
 }
 export interface TaskOutputOptions {
     stdoutOffset?: number;
     stderrOffset?: number;
     tailChars?: number;
+    readMode?: TaskReadMode;
 }
 export interface TaskWaitResult<TMeta extends object> extends TaskOutput<TMeta> {
     completed: boolean;
@@ -56,6 +59,7 @@ export interface ProcessTaskManagerOptions {
     minPollIntervalMs: number;
     pollRecommendation: string;
     unknownTaskLabel: string;
+    defaultReadWindowChars: number;
 }
 export declare class ProcessTaskManager<TMeta extends object> {
     private readonly options;

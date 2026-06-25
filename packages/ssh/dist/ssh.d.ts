@@ -1,7 +1,9 @@
-import { type TaskOutput, type TaskSnapshot, type TaskState, type TaskWaitResult } from "@remote-mcp/shared/task-manager";
+import { type TaskReadMode, type TaskOutput, type TaskSnapshot, type TaskState, type TaskWaitResult } from "@remote-mcp/shared/task-manager";
+import { type PersistentJobReadMode, type PersistentJobRecord } from "@remote-mcp/shared/persistentJobs";
 export type SshRunMode = "sync" | "async" | "watch";
 export type SshTimeoutBehavior = "kill" | "detach";
 export type SshTaskState = TaskState;
+export type SshReadMode = TaskReadMode;
 export interface SshRunResult {
     target: string;
     requestedTarget?: string;
@@ -58,6 +60,7 @@ export interface SshTaskOutputOptions {
     stdoutOffset?: number;
     stderrOffset?: number;
     tailChars?: number;
+    readMode?: SshReadMode;
 }
 export interface SshTaskWaitResult extends TaskWaitResult<SshTaskMeta> {
     waitMs: number;
@@ -130,11 +133,49 @@ export declare function runSshScript(options: SshRunOptions): Promise<SshRunResu
 export declare function startSshTask(options: SshRunOptions): Promise<SshTaskSnapshot>;
 export declare function listTasks(): SshTaskSnapshot[];
 export declare function observeTaskStatus(taskId: string): Promise<SshTaskSnapshot>;
-export declare function observeTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number): Promise<SshTaskOutput>;
-export declare function readTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number): SshTaskOutput;
+export declare function observeTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number, readMode?: SshReadMode): Promise<SshTaskOutput>;
+export declare function readTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number, readMode?: SshReadMode): SshTaskOutput;
 export declare function waitTask(taskId: string, waitMs?: number, options?: SshTaskOutputOptions): Promise<SshTaskWaitResult>;
 export declare function watchSshTask(options: SshRunOptions, timeoutMs?: number, timeoutBehavior?: SshTimeoutBehavior, outputOptions?: SshTaskOutputOptions): Promise<SshWatchResult>;
 export declare function cancelTask(taskId: string): SshTaskSnapshot;
 export declare function cancelAllTasksSync(): void;
 export declare function testSshTarget(target?: string, timeoutMs?: number): Promise<SshRunResult>;
+export interface SshPersistentJobOutput {
+    job: PersistentJobRecord;
+    stdout: string;
+    stderr: string;
+    stdoutOffset: number;
+    stderrOffset: number;
+    nextStdoutOffset: number;
+    nextStderrOffset: number;
+    stdoutLength: number;
+    stderrLength: number;
+    readMode: PersistentJobReadMode;
+    [key: string]: unknown;
+}
+export declare function startPersistentJob(options: {
+    command: string;
+    target?: string;
+    workdir?: string;
+    maxRuntimeMs?: number;
+}): Promise<PersistentJobRecord>;
+export declare function getPersistentJobStatus(jobId: string): Promise<PersistentJobRecord>;
+export declare function readPersistentJobOutput(jobId: string, options?: {
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    tailChars?: number;
+    readMode?: PersistentJobReadMode;
+}): Promise<SshPersistentJobOutput>;
+export declare function waitPersistentJob(jobId: string, waitMs: number, options?: {
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    tailChars?: number;
+    readMode?: PersistentJobReadMode;
+}): Promise<SshPersistentJobOutput & {
+    completed: boolean;
+    timedOut: boolean;
+    waitedMs: number;
+}>;
+export declare function cancelPersistentJob(jobId: string): Promise<PersistentJobRecord>;
+export declare function listPersistentJobs(): PersistentJobRecord[];
 //# sourceMappingURL=ssh.d.ts.map

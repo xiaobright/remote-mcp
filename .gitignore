@@ -2,3 +2,5 @@ node_modules/
 *.tsbuildinfo
 .env
 devices.json
+mcp-servers-config.json
+work/

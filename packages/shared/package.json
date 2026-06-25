@@ -30,6 +30,10 @@
       "types": "./dist/shell.d.ts",
       "default": "./dist/shell.js"
     },
+    "./persistentJobs": {
+      "types": "./dist/persistentJobs.d.ts",
+      "default": "./dist/persistentJobs.js"
+    },
     "./task-manager": {
       "types": "./dist/taskManager.d.ts",
       "default": "./dist/taskManager.js"

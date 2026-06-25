@@ -34,7 +34,14 @@ import {
   listDistros,
   listTasks,
   waitTask,
+  startPersistentJob,
+  getPersistentJobStatus,
+  readPersistentJobOutput,
+  waitPersistentJob,
+  cancelPersistentJob,
+  listPersistentJobs,
   type WslRunMode,
+  type WslReadMode,
   type WslTimeoutBehavior,
 } from "./wsl.js";
 
@@ -95,6 +102,7 @@ function formatTaskOutput(output: {
   stderr: string;
   nextStdoutOffset: number;
   nextStderrOffset: number;
+  readMode?: string;
   [key: string]: unknown;
 }): string {
   const poll = output.poll as { throttled?: boolean; waitedMs?: number } | undefined;
@@ -106,9 +114,42 @@ function formatTaskOutput(output: {
     output.stderr ? `\nSTDERR:\n${output.stderr}` : "",
     output.timeoutClamped && requestedTimeoutMs && effectiveMs ? `\nRequested timeout ${requestedTimeoutMs} ms was capped at ${effectiveMs} ms so the MCP client has time to receive the result before its outer tool-call timeout.` : "",
     output.waitClamped && requestedWaitMs && effectiveMs ? `\nRequested wait ${requestedWaitMs} ms was capped at ${effectiveMs} ms so the MCP client has time to receive the result before its outer tool-call timeout.` : "",
+    output.readMode === "full" ? "" : "\nRead mode: delta (bounded window). Use read_mode=\"full\" with offsets to page through retained output, or continue with the returned offsets.",
     `\nTask ${output.task.taskId}: ${output.task.state}`,
     `\nNext offsets: stdout=${output.nextStdoutOffset}, stderr=${output.nextStderrOffset}`,
     poll?.throttled ? `\nPolling was throttled inside the MCP server; waited ${poll.waitedMs} ms before returning.` : "",
+  ].filter(Boolean).join("");
+}
+
+function formatPersistentJobStarted(job: { jobId: string; backend: string; state: string; jobDir: string }): string {
+  return `Started persistent job ${job.jobId} (backend=${job.backend}, state=${job.state}). Logs at ${job.jobDir}. Use wsl_job action="status" to check progress.`;
+}
+
+function formatPersistentJobStatus(job: { jobId: string; state: string; exitCode: number | null; startedAt: string; endedAt: string | null }): string {
+  return `Job ${job.jobId}: ${job.state}${job.exitCode !== null ? ` (exit ${job.exitCode})` : ""}. Started ${job.startedAt}.${job.endedAt ? ` Ended ${job.endedAt}.` : ""}`;
+}
+
+function formatPersistentJobOutput(output: {
+  job: { jobId: string; state: string; exitCode: number | null };
+  stdout: string;
+  stderr: string;
+  nextStdoutOffset: number;
+  nextStderrOffset: number;
+  stdoutLength: number;
+  stderrLength: number;
+  readMode: string;
+  completed?: boolean;
+  timedOut?: boolean;
+  waitedMs?: number;
+}): string {
+  return [
+    output.stdout,
+    output.stderr ? `\nSTDERR:\n${output.stderr}` : "",
+    output.readMode === "full" ? "" : "\nRead mode: delta (bounded window). Use read_mode=\"full\" with offsets to page through the disk log, or continue with the returned offsets.",
+    `\nJob ${output.job.jobId}: ${output.job.state}${output.job.exitCode !== null ? ` (exit ${output.job.exitCode})` : ""}`,
+    `\nNext offsets: stdout=${output.nextStdoutOffset}/${output.stdoutLength}, stderr=${output.nextStderrOffset}/${output.stderrLength}`,
+    output.completed !== undefined ? `\nCompleted: ${output.completed}${output.timedOut ? " (timed out)" : ""}${output.waitedMs !== undefined ? ` after ${output.waitedMs} ms` : ""}` : "",
+    "\nPersistent job: detached, logs on disk, survives MCP restart.",
   ].filter(Boolean).join("");
 }
 
@@ -190,6 +231,7 @@ async function handleTaskAction(params: {
   stdoutOffset?: number;
   stderrOffset?: number;
   tailChars?: number;
+  readMode?: WslReadMode;
 }) {
   switch (params.action) {
     case "list": {
@@ -222,7 +264,13 @@ async function handleTaskAction(params: {
       if (!params.taskId) {
         throw new Error("taskId is required for output");
       }
-      const output = await observeTaskOutput(params.taskId, params.stdoutOffset, params.stderrOffset, params.tailChars);
+      const output = await observeTaskOutput(
+        params.taskId,
+        params.stdoutOffset,
+        params.stderrOffset,
+        params.tailChars,
+        params.readMode,
+      );
       return {
         content: [{ type: "text" as const, text: formatTaskOutput(output) }],
         structuredContent: output,
@@ -236,6 +284,7 @@ async function handleTaskAction(params: {
         stdoutOffset: params.stdoutOffset,
         stderrOffset: params.stderrOffset,
         tailChars: params.tailChars,
+        readMode: params.readMode,
       });
       return {
         content: [{ type: "text" as const, text: formatTaskOutput(output) }],
@@ -257,6 +306,100 @@ async function handleTaskAction(params: {
   }
 }
 
+async function handleJobAction(params: {
+  action: string;
+  command?: string;
+  jobId?: string;
+  workdir?: string;
+  maxRuntimeMs?: number;
+  waitMs?: number;
+  stdoutOffset?: number;
+  stderrOffset?: number;
+  tailChars?: number;
+  readMode?: WslReadMode;
+}) {
+  switch (params.action) {
+    case "start": {
+      if (!params.command) {
+        throw new Error("command is required for start");
+      }
+      const job = await startPersistentJob({
+        command: params.command,
+        workdir: params.workdir,
+        maxRuntimeMs: params.maxRuntimeMs,
+      });
+      return {
+        content: [{ type: "text" as const, text: formatPersistentJobStarted(job) }],
+        structuredContent: job,
+      };
+    }
+    case "status": {
+      if (!params.jobId) {
+        throw new Error("jobId is required for status");
+      }
+      const job = await getPersistentJobStatus(params.jobId);
+      return {
+        content: [{ type: "text" as const, text: formatPersistentJobStatus(job) }],
+        structuredContent: job,
+      };
+    }
+    case "output": {
+      if (!params.jobId) {
+        throw new Error("jobId is required for output");
+      }
+      const output = await readPersistentJobOutput(params.jobId, {
+        stdoutOffset: params.stdoutOffset,
+        stderrOffset: params.stderrOffset,
+        tailChars: params.tailChars,
+        readMode: params.readMode,
+      });
+      return {
+        content: [{ type: "text" as const, text: formatPersistentJobOutput(output) }],
+        structuredContent: output,
+      };
+    }
+    case "wait": {
+      if (!params.jobId) {
+        throw new Error("jobId is required for wait");
+      }
+      const output = await waitPersistentJob(params.jobId, params.waitMs ?? 30000, {
+        stdoutOffset: params.stdoutOffset,
+        stderrOffset: params.stderrOffset,
+        tailChars: params.tailChars,
+        readMode: params.readMode,
+      });
+      return {
+        content: [{ type: "text" as const, text: formatPersistentJobOutput(output) }],
+        structuredContent: output,
+      };
+    }
+    case "cancel": {
+      if (!params.jobId) {
+        throw new Error("jobId is required for cancel");
+      }
+      const job = await cancelPersistentJob(params.jobId);
+      return {
+        content: [{ type: "text" as const, text: `Job ${job.jobId}: ${job.state}.` }],
+        structuredContent: job,
+      };
+    }
+    case "list": {
+      const jobs = listPersistentJobs();
+      return {
+        content: [{
+          type: "text" as const,
+          text: jobs.length
+            ? jobs.map((job) => `${job.jobId}  ${job.state}  ${job.backend}  ${job.startedAt}`).join("\n")
+            : "No persistent jobs.",
+        }],
+        structuredContent: { jobs },
+      };
+    }
+    default:
+      throw new Error(`Unknown wsl_job action: ${params.action}`);
+  }
+}
+
 async function runCommandTool(params: {
   command: string;
   workdir?: string;
@@ -264,6 +407,7 @@ async function runCommandTool(params: {
   timeout_ms?: number;
   on_timeout?: WslTimeoutBehavior;
   tail_chars?: number;
+  read_mode?: WslReadMode;
 }) {
   const mode = params.mode ?? "sync";
   if (mode === "async") {
@@ -273,6 +417,7 @@ async function runCommandTool(params: {
   if (mode === "watch") {
     const output = await watchWslTask(params.command, "bash", params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
       tailChars: params.tail_chars,
+      readMode: params.read_mode,
     });
     return { content: [{ type: "text" as const, text: formatTaskOutput(output) }], structuredContent: output };
   }
@@ -289,6 +434,7 @@ async function runScriptTool(params: {
   timeout_ms?: number;
   on_timeout?: WslTimeoutBehavior;
   tail_chars?: number;
+  read_mode?: WslReadMode;
 }) {
   const shell = params.shell ?? "bash";
   const mode = params.mode ?? "sync";
@@ -299,6 +445,7 @@ async function runScriptTool(params: {
   if (mode === "watch") {
     const output = await watchWslTask(params.script, shell, params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
       tailChars: params.tail_chars,
+      readMode: params.read_mode,
     });
     return { content: [{ type: "text" as const, text: formatTaskOutput(output) }], structuredContent: output };
   }
@@ -315,10 +462,15 @@ function optionalTimeoutBehavior(value: unknown): WslTimeoutBehavior | undefined
   return value === "kill" || value === "detach" ? value : undefined;
 }
 
+function optionalReadMode(value: unknown): WslReadMode | undefined {
+  return value === "delta" || value === "full" ? value : undefined;
+}
+
 const wslExecParams = [
   "command",
   "mode",
   "on_timeout",
+  "read_mode",
   "tail_chars",
   "timeout_ms",
   "workdir",
@@ -329,6 +481,7 @@ const wslScriptParams = [
   "on_timeout",
   "script",
   "shell",
+  "read_mode",
   "tail_chars",
   "timeout_ms",
   "workdir",
@@ -343,9 +496,23 @@ const wslTaskParams = [
   "action",
   "stderrOffset",
   "stdoutOffset",
+  "read_mode",
   "tail_chars",
   "taskId",
   "wait_ms",
+];
+
+const wslJobParams = [
+  "action",
+  "command",
+  "jobId",
+  "max_runtime_ms",
+  "read_mode",
+  "stderrOffset",
+  "stdoutOffset",
+  "tail_chars",
+  "wait_ms",
+  "workdir",
 ];
 
 async function dispatchToolCall(name: string, argsInput: unknown) {
@@ -372,6 +539,7 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
         waitMs: optionalNumber(args.wait_ms),
         stdoutOffset: optionalNumber(args.stdoutOffset),
         stderrOffset: optionalNumber(args.stderrOffset),
+        readMode: optionalReadMode(args.read_mode),
         tailChars: optionalNumber(args.tail_chars),
       });
     case "wsl_exec":
@@ -384,6 +552,7 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
         mode: optionalRunMode(args.mode),
         timeout_ms: optionalNumber(args.timeout_ms),
         on_timeout: optionalTimeoutBehavior(args.on_timeout),
+        read_mode: optionalReadMode(args.read_mode),
         tail_chars: optionalNumber(args.tail_chars),
       });
     case "wsl_script":
@@ -397,7 +566,22 @@ async function dispatchToolCall(name: string, argsInput: unknown) {
         mode: optionalRunMode(args.mode),
         timeout_ms: optionalNumber(args.timeout_ms),
         on_timeout: optionalTimeoutBehavior(args.on_timeout),
+        read_mode: optionalReadMode(args.read_mode),
         tail_chars: optionalNumber(args.tail_chars),
+      });
+    case "wsl_job":
+      rejectUnexpectedParams(args, wslJobParams, "wsl_job");
+      return handleJobAction({
+        action: requireStringParam(args, "action", "wsl_job"),
+        command: optionalString(args.command),
+        jobId: optionalString(args.jobId),
+        workdir: optionalString(args.workdir),
+        maxRuntimeMs: optionalNumber(args.max_runtime_ms),
+        waitMs: optionalNumber(args.wait_ms),
+        stdoutOffset: optionalNumber(args.stdoutOffset),
+        stderrOffset: optionalNumber(args.stderrOffset),
+        readMode: optionalReadMode(args.read_mode),
+        tailChars: optionalNumber(args.tail_chars),
       });
     default:
       return {
@@ -515,6 +699,9 @@ poll interval is reached, then returns a warning plus the real result.`,
         .nonnegative()
         .optional()
         .describe("Read stderr starting at this character offset."),
+      read_mode: z.enum(["delta", "full"])
+        .optional()
+        .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
       tail_chars: z.number()
         .int()
         .positive()
@@ -528,23 +715,25 @@ poll interval is reached, then returns a warning plus the real result.`,
       openWorldHint: false,
     },
   },
-  async (params: {
-    action: string;
-    taskId?: string;
-    wait_ms?: number;
-    stdoutOffset?: number;
-    stderrOffset?: number;
-    tail_chars?: number;
-  }) => {
-    try {
-      return await handleTaskAction({
-        ...params,
-        waitMs: params.wait_ms,
-        tailChars: params.tail_chars,
-      });
-    } catch (error) {
-      return errorResponse(error);
-    }
+    async (params: {
+      action: string;
+      taskId?: string;
+      wait_ms?: number;
+      stdoutOffset?: number;
+      stderrOffset?: number;
+      read_mode?: WslReadMode;
+      tail_chars?: number;
+    }) => {
+      try {
+        return await handleTaskAction({
+          ...params,
+          waitMs: params.wait_ms,
+          readMode: params.read_mode,
+          tailChars: params.tail_chars,
+        });
+      } catch (error) {
+        return errorResponse(error);
+      }
   },
 );
 
@@ -616,6 +805,9 @@ Error Handling:
       on_timeout: timeoutBehaviorSchema
         .default("detach")
         .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
+      read_mode: z.enum(["delta", "full"])
+        .optional()
+        .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
       tail_chars: z.number()
         .int()
         .positive()
@@ -635,6 +827,7 @@ Error Handling:
     mode?: WslRunMode;
     timeout_ms?: number;
     on_timeout?: WslTimeoutBehavior;
+    read_mode?: WslReadMode;
     tail_chars?: number;
   }) => {
     try {
@@ -708,6 +901,9 @@ Error Handling:
       on_timeout: timeoutBehaviorSchema
         .default("detach")
         .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
+      read_mode: z.enum(["delta", "full"])
+        .optional()
+        .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
       tail_chars: z.number()
         .int()
         .positive()
@@ -728,10 +924,117 @@ Error Handling:
     mode?: WslRunMode;
     timeout_ms?: number;
     on_timeout?: WslTimeoutBehavior;
+    read_mode?: WslReadMode;
     tail_chars?: number;
   }) => {
     try {
       return await runScriptTool(params);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  },
+);
+
+server.registerTool(
+  "wsl_job",
+  {
+    title: "Manage WSL Persistent Job",
+    description: `Detached persistent job manager for WSL. Unlike wsl_task (attached, dies with MCP),
+persistent jobs run fully detached inside WSL via setsid. Logs and pid files
+live in ~/.remote-mcp/jobs/<jobId>/; metadata is stored on the Windows side.
+Any agent with the jobId can re-attach, read logs, or cancel — even after MCP
+or Codex restarts.
+
+Actions:
+  - start: launch a detached command. Returns jobId immediately.
+  - status: check job state (running/exited/cancelled/expired).
+  - output: read stdout/stderr logs with offsets or tail_chars.
+  - wait: poll until the job exits or wait_ms elapses, then return output.
+  - cancel: send SIGTERM to the job's process group.
+  - list: list all known persistent jobs.
+
+Use wsl_job for long-running tasks like firmware builds that may outlive the
+MCP process. Default read_mode is "delta" (bounded tail window) to prevent
+context explosion; use read_mode="full" with stdoutOffset/stderrOffset to page
+through complete logs without a single huge response.
+
+Parameters:
+  - action (required): start | status | output | wait | cancel | list
+  - command (required for start): shell command to execute detached.
+  - jobId (required for status/output/wait/cancel): UUID returned by start.
+  - workdir (optional, for start): working directory inside WSL.
+  - max_runtime_ms (optional, for start): auto-expire deadline. Default 1h.
+  - wait_ms (optional, for wait): max poll duration. Default 30000.
+  - stdoutOffset/stderrOffset: byte offsets for incremental reads.
+  - tail_chars: read only the last N characters from each stream.
+  - read_mode: "delta" (default) or "full".`,
+    inputSchema: z.object({
+      action: z.enum(["start", "status", "output", "wait", "cancel", "list"]),
+      command: z.string()
+        .optional()
+        .describe("Shell command for action=start. Runs detached via setsid."),
+      jobId: z.string()
+        .optional()
+        .describe("Job UUID for status/output/wait/cancel."),
+      workdir: z.string()
+        .optional()
+        .describe("Working directory inside WSL for action=start."),
+      max_runtime_ms: z.number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Auto-expire deadline for action=start. Default 3600000 (1h)."),
+      wait_ms: z.number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Max poll duration for action=wait. Default 30000."),
+      stdoutOffset: z.number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Read stdout starting at this byte offset."),
+      stderrOffset: z.number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Read stderr starting at this byte offset."),
+      read_mode: z.enum(["delta", "full"])
+        .optional()
+        .describe('"delta" (default) returns a bounded tail window; "full" reads one capped page from the requested offset.'),
+      tail_chars: z.number()
+        .int()
+        .positive()
+        .optional()
+        .describe("If set, ignore offsets and read only the last N characters from each stream."),
+    }).strict(),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (params: {
+    action: string;
+    command?: string;
+    jobId?: string;
+    workdir?: string;
+    max_runtime_ms?: number;
+    wait_ms?: number;
+    stdoutOffset?: number;
+    stderrOffset?: number;
+    read_mode?: WslReadMode;
+    tail_chars?: number;
+  }) => {
+    try {
+      return await handleJobAction({
+        ...params,
+        maxRuntimeMs: params.max_runtime_ms,
+        waitMs: params.wait_ms,
+        readMode: params.read_mode,
+        tailChars: params.tail_chars,
+      });
     } catch (error) {
       return errorResponse(error);
     }

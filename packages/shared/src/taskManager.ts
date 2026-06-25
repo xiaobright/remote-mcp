@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 
 export type TaskState = "running" | "exited" | "error" | "cancelled";
+export type TaskReadMode = "delta" | "full";
 
 export interface TaskSnapshotBase {
   taskId: string;
@@ -32,6 +33,7 @@ export interface TaskOutput<TMeta extends object> {
   nextStderrOffset: number;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  readMode: TaskReadMode;
   [key: string]: unknown;
 }
 
@@ -39,6 +41,7 @@ export interface TaskOutputOptions {
   stdoutOffset?: number;
   stderrOffset?: number;
   tailChars?: number;
+  readMode?: TaskReadMode;
 }
 
 export interface TaskWaitResult<TMeta extends object> extends TaskOutput<TMeta> {
@@ -89,6 +92,7 @@ export interface ProcessTaskManagerOptions {
   minPollIntervalMs: number;
   pollRecommendation: string;
   unknownTaskLabel: string;
+  defaultReadWindowChars: number;
 }
 
 function nowIso(): string {
@@ -108,18 +112,27 @@ function sliceTaskStream(
   baseOffset: number,
   requestedOffset?: number,
   tailChars?: number,
+  readMode: TaskReadMode = "delta",
+  defaultReadWindowChars = 8192,
 ): { text: string; offset: number; nextOffset: number; truncated: boolean } {
   const totalLength = baseOffset + content.length;
-  const offset = typeof tailChars === "number"
-    ? Math.max(baseOffset, totalLength - tailChars)
-    : Math.max(baseOffset, requestedOffset ?? baseOffset);
+  let offset = baseOffset;
+  if (typeof tailChars === "number") {
+    offset = Math.max(baseOffset, totalLength - tailChars);
+  } else if (typeof requestedOffset === "number") {
+    offset = Math.max(baseOffset, requestedOffset);
+  } else if (readMode === "full") {
+    offset = baseOffset;
+  } else {
+    offset = Math.max(baseOffset, totalLength - defaultReadWindowChars);
+  }
   const start = offset - baseOffset;
 
   return {
     text: content.slice(start),
     offset,
     nextOffset: totalLength,
-    truncated: (requestedOffset ?? offset) < baseOffset,
+    truncated: baseOffset > 0 || offset > baseOffset,
   };
 }
 
@@ -309,19 +322,34 @@ export class ProcessTaskManager<TMeta extends object> {
   }
 
   private readTaskOutputUnlocked(task: ManagedTask<TMeta>, options: TaskOutputOptions = {}): TaskOutput<TMeta> {
-    const stdout = sliceTaskStream(task.stdout, task.stdoutBaseOffset, options.stdoutOffset, options.tailChars);
-    const stderr = sliceTaskStream(task.stderr, task.stderrBaseOffset, options.stderrOffset, options.tailChars);
+    const stdoutSlice = sliceTaskStream(
+      task.stdout,
+      task.stdoutBaseOffset,
+      options.stdoutOffset,
+      options.tailChars,
+      options.readMode,
+      this.options.defaultReadWindowChars,
+    );
+    const stderrSlice = sliceTaskStream(
+      task.stderr,
+      task.stderrBaseOffset,
+      options.stderrOffset,
+      options.tailChars,
+      options.readMode,
+      this.options.defaultReadWindowChars,
+    );
 
     return {
       task: this.snapshot(task),
-      stdout: stdout.text,
-      stderr: stderr.text,
-      stdoutOffset: stdout.offset,
-      stderrOffset: stderr.offset,
-      nextStdoutOffset: stdout.nextOffset,
-      nextStderrOffset: stderr.nextOffset,
-      stdoutTruncated: stdout.truncated,
-      stderrTruncated: stderr.truncated,
+      stdout: stdoutSlice.text,
+      stderr: stderrSlice.text,
+      stdoutOffset: stdoutSlice.offset,
+      stderrOffset: stderrSlice.offset,
+      nextStdoutOffset: stdoutSlice.nextOffset,
+      nextStderrOffset: stderrSlice.nextOffset,
+      stdoutTruncated: stdoutSlice.truncated,
+      stderrTruncated: stderrSlice.truncated,
+      readMode: options.readMode ?? "delta",
     };
   }
 

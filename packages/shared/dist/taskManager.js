@@ -10,17 +10,27 @@ function makeFinishedLatch() {
     });
     return { finished, resolveFinished };
 }
-function sliceTaskStream(content, baseOffset, requestedOffset, tailChars) {
+function sliceTaskStream(content, baseOffset, requestedOffset, tailChars, readMode = "delta", defaultReadWindowChars = 8192) {
     const totalLength = baseOffset + content.length;
-    const offset = typeof tailChars === "number"
-        ? Math.max(baseOffset, totalLength - tailChars)
-        : Math.max(baseOffset, requestedOffset ?? baseOffset);
+    let offset = baseOffset;
+    if (typeof tailChars === "number") {
+        offset = Math.max(baseOffset, totalLength - tailChars);
+    }
+    else if (typeof requestedOffset === "number") {
+        offset = Math.max(baseOffset, requestedOffset);
+    }
+    else if (readMode === "full") {
+        offset = baseOffset;
+    }
+    else {
+        offset = Math.max(baseOffset, totalLength - defaultReadWindowChars);
+    }
     const start = offset - baseOffset;
     return {
         text: content.slice(start),
         offset,
         nextOffset: totalLength,
-        truncated: (requestedOffset ?? offset) < baseOffset,
+        truncated: baseOffset > 0 || offset > baseOffset,
     };
 }
 export class ProcessTaskManager {
@@ -190,18 +200,19 @@ export class ProcessTaskManager {
         return task;
     }
     readTaskOutputUnlocked(task, options = {}) {
-        const stdout = sliceTaskStream(task.stdout, task.stdoutBaseOffset, options.stdoutOffset, options.tailChars);
-        const stderr = sliceTaskStream(task.stderr, task.stderrBaseOffset, options.stderrOffset, options.tailChars);
+        const stdoutSlice = sliceTaskStream(task.stdout, task.stdoutBaseOffset, options.stdoutOffset, options.tailChars, options.readMode, this.options.defaultReadWindowChars);
+        const stderrSlice = sliceTaskStream(task.stderr, task.stderrBaseOffset, options.stderrOffset, options.tailChars, options.readMode, this.options.defaultReadWindowChars);
         return {
             task: this.snapshot(task),
-            stdout: stdout.text,
-            stderr: stderr.text,
-            stdoutOffset: stdout.offset,
-            stderrOffset: stderr.offset,
-            nextStdoutOffset: stdout.nextOffset,
-            nextStderrOffset: stderr.nextOffset,
-            stdoutTruncated: stdout.truncated,
-            stderrTruncated: stderr.truncated,
+            stdout: stdoutSlice.text,
+            stderr: stderrSlice.text,
+            stdoutOffset: stdoutSlice.offset,
+            stderrOffset: stderrSlice.offset,
+            nextStdoutOffset: stdoutSlice.nextOffset,
+            nextStderrOffset: stderrSlice.nextOffset,
+            stdoutTruncated: stdoutSlice.truncated,
+            stderrTruncated: stderrSlice.truncated,
+            readMode: options.readMode ?? "delta",
         };
     }
     async withTaskObservationThrottle(task, fn) {
