@@ -1,6 +1,7 @@
 import { type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { killProcessTree } from "./process.js";
 
 export type TaskState = "running" | "exited" | "error" | "cancelled";
 export type TaskReadMode = "delta" | "full";
@@ -248,9 +249,9 @@ export class ProcessTaskManager<TMeta extends object> {
     const task = this.getTask(taskId);
     if (task.state === "running" && task.proc) {
       task.state = "cancelled";
-      task.endedAt = nowIso();
-      task.proc.kill();
-      task.resolveFinished();
+      task.endedAt ??= nowIso();
+      // Kill the tree; let the close handler settle finished/exitCode.
+      killProcessTree(task.proc);
     }
 
     return this.snapshot(task);
@@ -260,9 +261,8 @@ export class ProcessTaskManager<TMeta extends object> {
     for (const task of this.tasks.values()) {
       if (task.state === "running" && task.proc) {
         task.state = "cancelled";
-        task.endedAt = nowIso();
-        task.proc.kill();
-        task.resolveFinished();
+        task.endedAt ??= nowIso();
+        killProcessTree(task.proc);
       }
     }
   }

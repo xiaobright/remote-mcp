@@ -22,6 +22,10 @@
       "types": "./dist/process.d.ts",
       "default": "./dist/process.js"
     },
+    "./fileLock": {
+      "types": "./dist/fileLock.d.ts",
+      "default": "./dist/fileLock.js"
+    },
     "./remote": {
       "types": "./dist/remote/index.d.ts",
       "default": "./dist/remote/index.js"

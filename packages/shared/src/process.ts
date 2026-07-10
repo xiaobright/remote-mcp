@@ -1,4 +1,4 @@
-import { spawn, type SpawnOptions, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { homedir } from "node:os";
 
 export interface ProcessRunResult {
@@ -29,6 +29,42 @@ export function windowsHiddenSpawnOptions(extra?: SpawnOptions): SpawnOptions {
   };
 }
 
+/**
+ * Best-effort kill of a spawned child and its descendants.
+ * On Windows uses taskkill /T; on POSIX tries the process group then the pid.
+ */
+export function killProcessTree(proc: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void {
+  const pid = proc.pid;
+  if (!pid) {
+    return;
+  }
+
+  if (process.platform === "win32") {
+    try {
+      spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+        ...windowsHiddenSpawnOptions(),
+        stdio: "ignore",
+      }).unref();
+      return;
+    } catch {
+      // fall through to proc.kill
+    }
+  } else {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // process may not be a group leader
+    }
+  }
+
+  try {
+    proc.kill(signal);
+  } catch {
+    // already dead
+  }
+}
+
 export async function runProcessWithInput(
   command: string,
   args: string[],
@@ -45,7 +81,7 @@ export async function runProcessWithInput(
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      killProcessTree(child);
     }, timeoutMs);
     timer.unref();
 

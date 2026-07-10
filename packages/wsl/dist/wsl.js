@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv } from "@remote-mcp/shared/env";
-import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
+import { killProcessTree, windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
 import { buildWorkdirPreamble } from "@remote-mcp/shared/shell";
 import { buildPersistentJobCancelScript, buildPersistentJobInspectScript, buildPersistentJobRunnerScript, getPersistentJob, listPersistentJobs as listPersistentJobsFromStore, parsePersistentJobInspect, resolveDefaultPersistentJobStorePath, touchPersistentJob, upsertPersistentJob, } from "@remote-mcp/shared/persistentJobs";
 import { ProcessTaskManager, } from "@remote-mcp/shared/task-manager";
@@ -242,7 +242,7 @@ function stopSessionUnlocked() {
     const wasRunning = active !== null;
     if (active) {
         expectedKeepaliveExits.add(active);
-        active.kill();
+        killProcessTree(active);
         keepalive = null;
     }
     const state = getSessionState();
@@ -330,7 +330,7 @@ async function spawnWslCommandRaw(cmdArgs, input, options = {}) {
             let settled = false;
             timer = setTimeout(() => {
                 timedOut = true;
-                proc.kill();
+                killProcessTree(proc);
             }, timeout.ms);
             timer.unref();
             proc.stdout?.on("data", (data) => { stdout.push(data); });
@@ -540,7 +540,7 @@ async function spawnWslOnce(cmdArgs, input, timeoutMs = PERSISTENT_JOB_OP_TIMEOU
         let settled = false;
         const timer = setTimeout(() => {
             timedOut = true;
-            proc.kill();
+            killProcessTree(proc);
         }, timeoutMs);
         timer.unref();
         proc.stdout?.on("data", (data) => { stdout.push(data); });
@@ -587,7 +587,7 @@ async function spawnWslOnceForDistro(distro, cmdArgs, input, timeoutMs = PERSIST
         let settled = false;
         const timer = setTimeout(() => {
             timedOut = true;
-            proc.kill();
+            killProcessTree(proc);
         }, timeoutMs);
         timer.unref();
         proc.stdout?.on("data", (data) => { stdout.push(data); });
@@ -770,8 +770,23 @@ export async function waitPersistentJob(jobId, waitMs, options = {}) {
 }
 export async function cancelPersistentJob(jobId) {
     const record = requireWslJob(jobId);
+    if (record.state !== "running" && record.state !== "starting") {
+        return record;
+    }
     const script = buildPersistentJobCancelScript(jobId);
-    await execWslScriptForDistro(script, record.configuredDistro);
+    const result = await execWslScriptForDistro(script, record.configuredDistro);
+    if (result.exitCode !== 0) {
+        const refreshed = await refreshPersistentJobRecord(record);
+        if (refreshed.state === "running" || refreshed.state === "starting") {
+            throw new Error(`Failed to cancel persistent job ${jobId}: ${result.stderr.trim() || result.stdout.trim() || `wsl exit ${result.exitCode}`}`);
+        }
+        return refreshed;
+    }
+    const line = result.stdout.trim().split(/\r?\n/).find((entry) => entry.includes("\t")) ?? "";
+    const outcome = line.split("\t")[0] || "cancelled";
+    if (outcome === "already_dead") {
+        return refreshPersistentJobRecord(record);
+    }
     return touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, {
         state: "cancelled",
         endedAt: nowIso(),

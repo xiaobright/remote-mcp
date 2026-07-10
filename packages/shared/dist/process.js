@@ -19,6 +19,43 @@ export function windowsHiddenSpawnOptions(extra) {
         windowsHide: true,
     };
 }
+/**
+ * Best-effort kill of a spawned child and its descendants.
+ * On Windows uses taskkill /T; on POSIX tries the process group then the pid.
+ */
+export function killProcessTree(proc, signal = "SIGTERM") {
+    const pid = proc.pid;
+    if (!pid) {
+        return;
+    }
+    if (process.platform === "win32") {
+        try {
+            spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+                ...windowsHiddenSpawnOptions(),
+                stdio: "ignore",
+            }).unref();
+            return;
+        }
+        catch {
+            // fall through to proc.kill
+        }
+    }
+    else {
+        try {
+            process.kill(-pid, signal);
+            return;
+        }
+        catch {
+            // process may not be a group leader
+        }
+    }
+    try {
+        proc.kill(signal);
+    }
+    catch {
+        // already dead
+    }
+}
 export async function runProcessWithInput(command, args, input, timeoutMs, options) {
     return new Promise((resolve, reject) => {
         const child = spawn(command, args, windowsHiddenSpawnOptions(options));
@@ -28,7 +65,7 @@ export async function runProcessWithInput(command, args, input, timeoutMs, optio
         let timedOut = false;
         const timer = setTimeout(() => {
             timedOut = true;
-            child.kill();
+            killProcessTree(child);
         }, timeoutMs);
         timer.unref();
         child.stdout?.on("data", (chunk) => stdout.push(chunk));

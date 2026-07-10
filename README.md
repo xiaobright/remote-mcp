@@ -40,6 +40,7 @@ WSL:
 - `wsl_exec`
 - `wsl_script`
 - `wsl_task`
+- `wsl_job`（持久任务：setsid 脱离 MCP 生命周期）
 - `wsl_file_read`
 - `wsl_file_write`
 - `wsl_file_edit`
@@ -54,6 +55,7 @@ SSH:
 - `ssh_exec`
 - `ssh_script`
 - `ssh_task`
+- `ssh_job`（持久任务：远程 setsid，日志在远端 `~/.remote-mcp/jobs/`）
 - `ssh_file_read`
 - `ssh_file_write`
 - `ssh_file_edit`
@@ -61,6 +63,15 @@ SSH:
 - `ssh_file_list`
 - `ssh_file_stat`
 - `ssh_file_search`
+
+## 任务模型
+
+| 类型 | 工具 | 生命周期 | 说明 |
+|------|------|----------|------|
+| attached task | `*_exec`/`*_script` mode=`async`/`watch` + `*_task` | 随 MCP 进程 | 本地 child（ssh/wsl.exe）存活期间可读输出 |
+| persistent job | `*_job` | 跨 MCP 重启 | 远端/WSL 内 setsid；取消以 session leader PID 为准并校验存活 |
+
+`*_task` 的 cancel 会尽量杀掉本地进程树（Windows 上 `taskkill /T`）；远端若已 `nohup`/daemon 化可能仍残留。长任务且需跨重启请用 `*_job`。
 
 ## 文件编辑模型
 
@@ -77,6 +88,7 @@ SSH:
 - 支持 `*** Add File` 和 `*** Update File`。
 - 不支持 delete/move，避免模型在大 patch 里顺手删除文件。
 - hunk 匹配在本地完成，按 context+removed 行作为连续 subsequence 查找。
+- **两阶段应用**：先对所有文件完成读入与 hunk 匹配，再统一写入；规划阶段失败时不会写任何文件。写入阶段若中途失败，错误会注明可能已部分写入。
 - 空行或无 marker 行会被当作 context，但会写入 `structuredContent.normalizations`。
 - 重复匹配会写入 `structuredContent.warnings`。
 
@@ -88,11 +100,12 @@ SSH:
 - `structuredContent` 放稳定字段，例如 path、sha256、bytes、encoding、warnings。
 - 文件读取的全文在 `structuredContent.text`，`content[0].text` 只放摘要，避免客户端同时展示两份大文本。
 
-## 构建
+## 构建与测试
 
 ```powershell
 npm install
 npm run build
+npm test
 ```
 
 ## 运行
@@ -135,11 +148,25 @@ WSL_MCP_DEFAULT_DISTRO = "Ubuntu-24.04"
 ## 安全边界
 
 - SSH MCP 不保存密码。建议使用 SSH key。
-- `devices.json`、`.env` 和 `node_modules` 已加入 `.gitignore`。
+- 默认 `StrictHostKeyChecking=accept-new` 便于首次连接；生产环境可设 `SSH_MCP_STRICT_HOST_KEY_CHECKING=yes`。
+- `devices.json`、`.env` 和 `node_modules` 已加入 `.gitignore`。device 与 persistent job 元数据写入有本地文件锁。
 - 文件工具会修改远程文件，请把它当成真实写操作。
 - `*_file_apply_patch` 不支持删除文件。
-- WSL 工具默认保护 `/mnt` 下的常见递归删除操作。
+- WSL 工具默认拦截常见删除命令（`rm`/`rmdir`/`unlink`/带 delete 的 `rsync`）目标落在 `/mnt` 的情况。这是**最佳努力**，不是沙箱：`command rm`、`find -delete`、Python/`os.remove` 等仍可绕过。
 - 这个项目由 AI 生成，公开使用前请按自己的威胁模型审计。
+
+## 主要环境变量
+
+| 变量 | 作用 |
+|------|------|
+| `SSH_MCP_DEFAULT_TARGET` | 默认 SSH target 或 device 名 |
+| `SSH_MCP_DEVICES_PATH` | device 配置文件路径 |
+| `SSH_MCP_STRICT_HOST_KEY_CHECKING` | 默认 `accept-new` |
+| `SSH_MCP_BATCH_MODE` | 设为 `0` 可关闭 BatchMode |
+| `WSL_MCP_DEFAULT_DISTRO` | 默认 WSL 发行版 |
+| `WSL_MCP_PROTECT_MNT_DELETE` | 设为 `0` 关闭 /mnt 删除防护 |
+| `*_MAX_TOOL_TIMEOUT_MS` | 单次工具超时上限（默认 540s） |
+| `*_PERSISTENT_JOB_MAX_RUNTIME_MS` | 持久任务默认最大运行时间（1h） |
 
 ## 开源许可
 

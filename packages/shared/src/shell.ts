@@ -21,7 +21,13 @@ export function joinRemotePath(root: string | undefined, path: string): string {
 }
 
 export function dirnameScript(pathVar: string, outVar: string): string {
-  return `${outVar}=\${${pathVar}%/*}\nif [ "$${outVar}" = "$${pathVar}" ]; then ${outVar}=.; fi`;
+  // ${path%/*} yields empty for root-level paths like /foo; treat that as /.
+  return [
+    `${outVar}=\${${pathVar}%/*}`,
+    `if [ "$${outVar}" = "$${pathVar}" ]; then ${outVar}=.`,
+    `elif [ -z "$${outVar}" ]; then ${outVar}=/`,
+    `fi`,
+  ].join("\n");
 }
 
 export function validateShell(shell: string): string {

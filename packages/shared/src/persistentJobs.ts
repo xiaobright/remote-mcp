@@ -1,14 +1,11 @@
 import {
-  closeSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
-  statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { withFileLock } from "./fileLock.js";
 
 export type PersistentJobBackend = "wsl" | "ssh";
 export type PersistentJobState = "starting" | "running" | "exited" | "error" | "cancelled" | "expired";
@@ -58,59 +55,11 @@ function readPositiveIntEnv(name: string, fallback: number): number {
 const STORE_LOCK_WAIT_MS = readPositiveIntEnv("REMOTE_MCP_PERSISTENT_JOB_STORE_LOCK_WAIT_MS", 5000);
 const STORE_LOCK_STALE_MS = readPositiveIntEnv("REMOTE_MCP_PERSISTENT_JOB_STORE_LOCK_STALE_MS", 30000);
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function withPersistentJobStoreLock<T>(storePath: string, fn: () => T): T {
-  mkdirSync(dirname(storePath), { recursive: true });
-  const lockPath = `${storePath}.lock`;
-  const started = Date.now();
-  let fd: number | null = null;
-
-  while (fd === null) {
-    try {
-      fd = openSync(lockPath, "wx");
-      writeFileSync(fd, `${process.pid}\n${nowIso()}\n`, "utf8");
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        throw error;
-      }
-
-      try {
-        const stat = statSync(lockPath);
-        if (Date.now() - stat.mtimeMs > STORE_LOCK_STALE_MS) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch (statError) {
-        const statCode = (statError as NodeJS.ErrnoException).code;
-        if (statCode !== "ENOENT") {
-          throw statError;
-        }
-      }
-
-      if (Date.now() - started > STORE_LOCK_WAIT_MS) {
-        throw new Error(`Timed out waiting for persistent job store lock: ${lockPath}`);
-      }
-      sleepSync(50);
-    }
-  }
-
-  try {
-    return fn();
-  } finally {
-    closeSync(fd);
-    try {
-      unlinkSync(lockPath);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        throw error;
-      }
-    }
-  }
+  return withFileLock(storePath, fn, {
+    waitMs: STORE_LOCK_WAIT_MS,
+    staleMs: STORE_LOCK_STALE_MS,
+  });
 }
 
 export function emptyPersistentJobStore(): PersistentJobStore {
@@ -270,6 +219,8 @@ export interface PersistentJobRunnerOptions {
  */
 export function buildPersistentJobRunnerScript(options: PersistentJobRunnerOptions): string {
   const { jobId, commandB64, workdirB64, maxRuntimeMs } = options;
+  // Session leader writes both runner.pid and pgid as $$ (PID == PGID after setsid).
+  // Do NOT trust the parent shell's $! — setsid often forks and $! is a short-lived parent.
   return [
     `JOB_ID=${shellSingleQuote(jobId)}`,
     `JOB_DIR="$HOME/.remote-mcp/jobs/$JOB_ID"`,
@@ -277,15 +228,34 @@ export function buildPersistentJobRunnerScript(options: PersistentJobRunnerOptio
     `: > "$JOB_DIR/stdout.log"`,
     `: > "$JOB_DIR/stderr.log"`,
     `: > "$JOB_DIR/daemon.log"`,
-    `printf 'running' > "$JOB_DIR/status"`,
-    `printf '%s' ${shellSingleQuote(commandB64)} | base64 -d > "$JOB_DIR/cmd.sh"`,
+    `printf 'starting' > "$JOB_DIR/status"`,
+    `decode_b64() {`,
+    `  if command -v base64 >/dev/null 2>&1; then`,
+    `    printf '%s' "$1" | base64 -d 2>/dev/null && return 0`,
+    `    printf '%s' "$1" | base64 --decode 2>/dev/null && return 0`,
+    `    printf '%s' "$1" | base64 -D 2>/dev/null && return 0`,
+    `  fi`,
+    `  return 1`,
+    `}`,
+    `decode_b64 ${shellSingleQuote(commandB64)} > "$JOB_DIR/cmd.sh" || { printf 'error: base64 decode failed' > "$JOB_DIR/status"; exit 1; }`,
     `WORKDIR_B64=${shellSingleQuote(workdirB64)}`,
     `MAX_RUNTIME_MS=${Math.max(0, Math.floor(maxRuntimeMs))}`,
     `setsid bash -c '`,
     `job_dir="$1"; workdir_b64="$2"; max_runtime_ms="$3"`,
-    `workdir="$(printf "%s" "$workdir_b64" | base64 -d)"`,
+    `decode_b64() {`,
+    `  if command -v base64 >/dev/null 2>&1; then`,
+    `    printf "%s" "$1" | base64 -d 2>/dev/null && return 0`,
+    `    printf "%s" "$1" | base64 --decode 2>/dev/null && return 0`,
+    `    printf "%s" "$1" | base64 -D 2>/dev/null && return 0`,
+    `  fi`,
+    `  return 1`,
+    `}`,
+    `workdir="$(decode_b64 "$workdir_b64" 2>/dev/null || true)"`,
     `if [ -n "$workdir" ]; then cd "$workdir" 2>/dev/null || cd "$HOME"; else cd "$HOME"; fi`,
+    `# $$ is the setsid session leader: PID and PGID are identical.`,
     `printf "%s" "$$" > "$job_dir/runner.pid"`,
+    `printf "%s" "$$" > "$job_dir/pgid"`,
+    `printf "running" > "$job_dir/status"`,
     `expired_file="$job_dir/expired"`,
     `on_term() { if [ -f "$expired_file" ]; then printf "expired" > "$job_dir/status"; else printf "cancelled" > "$job_dir/status"; fi; exit 143; }`,
     `trap on_term TERM INT`,
@@ -303,9 +273,8 @@ export function buildPersistentJobRunnerScript(options: PersistentJobRunnerOptio
     `if [ -f "$expired_file" ]; then printf "expired" > "$job_dir/status"; else printf "%s" "$exit_code" > "$job_dir/status"; fi`,
     `exit "$exit_code"`,
     `' _ "$JOB_DIR" "$WORKDIR_B64" "$MAX_RUNTIME_MS" </dev/null >>"$JOB_DIR/daemon.log" 2>&1 &`,
-    `printf "%s" "$!" > "$JOB_DIR/pgid"`,
-    `# Wait for setsid child to initialise so it survives parent shell exit`,
-    `for _w in 1 2 3 4 5 6 7 8 9 10; do [ -f "$JOB_DIR/runner.pid" ] && break; sleep 0.2; done`,
+    `# Wait for session leader to initialise so it survives parent shell exit`,
+    `for _w in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -f "$JOB_DIR/runner.pid" ] && [ -s "$JOB_DIR/runner.pid" ] && break; sleep 0.2; done`,
   ].join("\n") + "\n";
 }
 
@@ -431,25 +400,59 @@ export function parsePersistentJobInspect(raw: string): PersistentJobInspectResu
 
 /**
  * Builds a bash script that cancels a persistent job by sending SIGTERM to
- * its process group. Prefers the pgid file, falling back to runner.pid (which
- * equals the PGID for a setsid session leader).
+ * its process group. Prefers runner.pid (session leader written from inside
+ * setsid) over the pgid file. Verifies the process is gone before claiming
+ * success; does not mark cancelled if the kill target is still alive.
  */
 export function buildPersistentJobCancelScript(jobId: string): string {
   return [
     `JOB_ID=${shellSingleQuote(jobId)}`,
     `JOB_DIR="$HOME/.remote-mcp/jobs/$JOB_ID"`,
+    `STATUS_FILE="$JOB_DIR/status"`,
     `PGID=""`,
-    `[ -f "$JOB_DIR/pgid" ] && PGID=$(cat "$JOB_DIR/pgid" 2>/dev/null)`,
-    `if [ -z "$PGID" ] && [ -f "$JOB_DIR/runner.pid" ]; then PGID=$(cat "$JOB_DIR/runner.pid" 2>/dev/null); fi`,
-    `if [ -n "$PGID" ]; then`,
-    `  kill -TERM -"$PGID" 2>/dev/null || kill -TERM "$PGID" 2>/dev/null || true`,
-    `  sleep 2`,
-    `  kill -KILL -"$PGID" 2>/dev/null || kill -KILL "$PGID" 2>/dev/null || true`,
-    `  printf 'cancelled' > "$JOB_DIR/status" 2>/dev/null || true`,
-    `  printf 'cancelled\\t%s\\n' "$PGID"`,
-    `else`,
-    `  printf 'cancelled' > "$JOB_DIR/status" 2>/dev/null || true`,
+    `# Prefer runner.pid: it is written by the setsid session leader as $$.`,
+    `[ -f "$JOB_DIR/runner.pid" ] && PGID=$(tr -d ' \\t\\r\\n' < "$JOB_DIR/runner.pid" 2>/dev/null)`,
+    `if [ -z "$PGID" ] && [ -f "$JOB_DIR/pgid" ]; then PGID=$(tr -d ' \\t\\r\\n' < "$JOB_DIR/pgid" 2>/dev/null); fi`,
+    `alive() { kill -0 "$1" 2>/dev/null || kill -0 -"$1" 2>/dev/null; }`,
+    `if [ -z "$PGID" ]; then`,
+    `  # No pid files: job may never have started or already cleaned up.`,
+    `  if [ -f "$STATUS_FILE" ]; then`,
+    `    cur=$(cat "$STATUS_FILE" 2>/dev/null || true)`,
+    `    case "$cur" in`,
+    `      running|starting) printf 'cancelled' > "$STATUS_FILE" 2>/dev/null || true ;;`,
+    `    esac`,
+    `  else`,
+    `    printf 'cancelled' > "$STATUS_FILE" 2>/dev/null || true`,
+    `  fi`,
     `  printf 'cancelled\\tnone\\n'`,
+    `  exit 0`,
     `fi`,
+    `if ! alive "$PGID"; then`,
+    `  # Already dead — do not overwrite a real exit code with cancelled.`,
+    `  if [ -f "$STATUS_FILE" ]; then`,
+    `    cur=$(cat "$STATUS_FILE" 2>/dev/null || true)`,
+    `    case "$cur" in`,
+    `      running|starting) printf 'cancelled' > "$STATUS_FILE" 2>/dev/null || true ;;`,
+    `    esac`,
+    `  fi`,
+    `  printf 'already_dead\\t%s\\n' "$PGID"`,
+    `  exit 0`,
+    `fi`,
+    `kill -TERM -"$PGID" 2>/dev/null || kill -TERM "$PGID" 2>/dev/null || true`,
+    `for _i in 1 2 3 4 5 6 7 8 9 10; do`,
+    `  alive "$PGID" || break`,
+    `  sleep 0.2`,
+    `done`,
+    `if alive "$PGID"; then`,
+    `  kill -KILL -"$PGID" 2>/dev/null || kill -KILL "$PGID" 2>/dev/null || true`,
+    `  sleep 0.5`,
+    `fi`,
+    `if alive "$PGID"; then`,
+    `  printf 'cancel_failed\\t%s\\n' "$PGID"`,
+    `  exit 1`,
+    `fi`,
+    `printf 'cancelled' > "$STATUS_FILE" 2>/dev/null || true`,
+    `printf 'cancelled\\t%s\\n' "$PGID"`,
+    `exit 0`,
   ].join("\n") + "\n";
 }

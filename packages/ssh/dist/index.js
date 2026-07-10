@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { asRecord, errorResponse, optionalBoolean, optionalNumber, optionalString, optionalStringArray, optionalStringRecord, rejectUnexpectedParams, requireStringParam, } from "@remote-mcp/shared/mcp";
+import { errorResponse } from "@remote-mcp/shared/mcp";
 import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
 import { cancelAllTasksSync, cancelTask, candidateTargetsFor, getDevice, getSshState, listDevices, listTasks, observeTaskOutput, observeTaskStatus, removeDevice, runSshRawScript, runSshScript, setDefaultTarget, startSshTask, testSshTarget, upsertDevice, waitTask, watchSshTask, startPersistentJob, getPersistentJobStatus, readPersistentJobOutput, waitPersistentJob, cancelPersistentJob, listPersistentJobs, } from "./ssh.js";
 const server = new McpServer({
@@ -12,7 +11,7 @@ const server = new McpServer({
 });
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
-const sshFileToolHandlers = registerRemoteFileTools({
+registerRemoteFileTools({
     server,
     prefix: "ssh_file",
     titlePrefix: "SSH",
@@ -31,12 +30,14 @@ const sshFileToolHandlers = registerRemoteFileTools({
             .describe("Timeout for each underlying SSH shell operation."),
     },
     makeRunner: (params) => (script) => runSshRawScript({
-        target: optionalString(params.target),
+        target: typeof params.target === "string" ? params.target : undefined,
         script,
         shell: "sh",
         login: false,
-        sshOptions: optionalStringArray(params.ssh_options),
-        timeoutMs: optionalNumber(params.timeout_ms),
+        sshOptions: Array.isArray(params.ssh_options) && params.ssh_options.every((item) => typeof item === "string")
+            ? params.ssh_options
+            : undefined,
+        timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : undefined,
     }),
 });
 function formatCommandResult(result) {
@@ -86,80 +87,6 @@ function formatPersistentJobOutput(output) {
         "\nPersistent job: detached, logs on disk, survives MCP restart.",
     ].filter(Boolean).join("");
 }
-function optionalRunMode(value) {
-    return value === "sync" || value === "async" || value === "watch" ? value : undefined;
-}
-function optionalTimeoutBehavior(value) {
-    return value === "kill" || value === "detach" ? value : undefined;
-}
-function optionalReadMode(value) {
-    return value === "delta" || value === "full" ? value : undefined;
-}
-const sshExecParams = [
-    "command",
-    "env",
-    "login",
-    "mode",
-    "on_timeout",
-    "read_mode",
-    "shell",
-    "ssh_options",
-    "tail_chars",
-    "target",
-    "timeout_ms",
-    "workdir",
-];
-const sshScriptParams = [
-    "env",
-    "login",
-    "mode",
-    "on_timeout",
-    "read_mode",
-    "script",
-    "shell",
-    "ssh_options",
-    "tail_chars",
-    "target",
-    "timeout_ms",
-    "workdir",
-];
-const sshProfileParams = [
-    "action",
-    "defaultWorkdir",
-    "host",
-    "hosts",
-    "identityFile",
-    "name",
-    "notes",
-    "port",
-    "ssh_options",
-    "tags",
-    "target",
-    "timeout_ms",
-    "user",
-];
-const sshTaskParams = [
-    "action",
-    "stderrOffset",
-    "stdoutOffset",
-    "read_mode",
-    "tail_chars",
-    "taskId",
-    "wait_ms",
-];
-const sshJobParams = [
-    "action",
-    "command",
-    "jobId",
-    "max_runtime_ms",
-    "read_mode",
-    "stderrOffset",
-    "stdoutOffset",
-    "tail_chars",
-    "target",
-    "wait_ms",
-    "workdir",
-];
 async function handleProfileAction(params) {
     switch (params.action) {
         case "status": {
@@ -439,101 +366,8 @@ async function runScriptTool(params) {
     const result = await runSshScript(options);
     return { content: [{ type: "text", text: formatCommandResult(result) }], structuredContent: result };
 }
-async function dispatchToolCall(name, argsInput) {
-    const args = asRecord(argsInput);
-    const fileHandler = sshFileToolHandlers[name];
-    if (fileHandler) {
-        return fileHandler(args);
-    }
-    switch (name) {
-        case "ssh_profile":
-            rejectUnexpectedParams(args, sshProfileParams, "ssh_profile");
-            return handleProfileAction({
-                action: requireStringParam(args, "action", "ssh_profile"),
-                target: optionalString(args.target),
-                name: optionalString(args.name),
-                user: optionalString(args.user),
-                host: optionalString(args.host),
-                hosts: optionalStringArray(args.hosts),
-                port: optionalNumber(args.port),
-                identityFile: optionalString(args.identityFile),
-                defaultWorkdir: optionalString(args.defaultWorkdir),
-                ssh_options: optionalStringArray(args.ssh_options),
-                tags: optionalStringArray(args.tags),
-                notes: optionalString(args.notes),
-                timeout_ms: optionalNumber(args.timeout_ms),
-            });
-        case "ssh_task":
-            rejectUnexpectedParams(args, sshTaskParams, "ssh_task", {
-                tailChars: 'ssh_task expects "tail_chars"; camelCase "tailChars" is not supported.',
-            });
-            return handleTaskAction({
-                action: requireStringParam(args, "action", "ssh_task"),
-                taskId: optionalString(args.taskId),
-                waitMs: optionalNumber(args.wait_ms),
-                stdoutOffset: optionalNumber(args.stdoutOffset),
-                stderrOffset: optionalNumber(args.stderrOffset),
-                readMode: optionalReadMode(args.read_mode),
-                tailChars: optionalNumber(args.tail_chars),
-            });
-        case "ssh_exec":
-            rejectUnexpectedParams(args, sshExecParams, "ssh_exec", {
-                script: 'ssh_exec expects "command"; use ssh_script when you want the parameter to be named "script".',
-            });
-            return runScriptTool({
-                target: optionalString(args.target),
-                script: requireStringParam(args, "command", "ssh_exec"),
-                shell: optionalString(args.shell),
-                login: optionalBoolean(args.login),
-                workdir: optionalString(args.workdir),
-                env: optionalStringRecord(args.env),
-                ssh_options: optionalStringArray(args.ssh_options),
-                mode: optionalRunMode(args.mode),
-                timeout_ms: optionalNumber(args.timeout_ms),
-                on_timeout: optionalTimeoutBehavior(args.on_timeout),
-                read_mode: optionalReadMode(args.read_mode),
-                tail_chars: optionalNumber(args.tail_chars),
-            });
-        case "ssh_script":
-            rejectUnexpectedParams(args, sshScriptParams, "ssh_script", {
-                command: 'ssh_script expects "script"; use ssh_exec when you want the parameter to be named "command".',
-            });
-            return runScriptTool({
-                target: optionalString(args.target),
-                script: requireStringParam(args, "script", "ssh_script"),
-                shell: optionalString(args.shell),
-                login: optionalBoolean(args.login),
-                workdir: optionalString(args.workdir),
-                env: optionalStringRecord(args.env),
-                ssh_options: optionalStringArray(args.ssh_options),
-                mode: optionalRunMode(args.mode),
-                timeout_ms: optionalNumber(args.timeout_ms),
-                on_timeout: optionalTimeoutBehavior(args.on_timeout),
-                read_mode: optionalReadMode(args.read_mode),
-                tail_chars: optionalNumber(args.tail_chars),
-            });
-        case "ssh_job":
-            rejectUnexpectedParams(args, sshJobParams, "ssh_job");
-            return handleJobAction({
-                action: requireStringParam(args, "action", "ssh_job"),
-                command: optionalString(args.command),
-                jobId: optionalString(args.jobId),
-                target: optionalString(args.target),
-                workdir: optionalString(args.workdir),
-                maxRuntimeMs: optionalNumber(args.max_runtime_ms),
-                waitMs: optionalNumber(args.wait_ms),
-                stdoutOffset: optionalNumber(args.stdoutOffset),
-                stderrOffset: optionalNumber(args.stderrOffset),
-                readMode: optionalReadMode(args.read_mode),
-                tailChars: optionalNumber(args.tail_chars),
-            });
-        default:
-            return {
-                content: [{ type: "text", text: `Error: Tool ${name} not found` }],
-                isError: true,
-            };
-    }
-}
+// Tool invocations go only through registerTool callbacks so MCP SDK Zod
+// validation runs. Do not override CallToolRequestSchema on server.server.
 server.registerTool("ssh_profile", {
     title: "Manage SSH Target",
     description: `Unified process-local SSH target/profile helper and lightweight device registry.
@@ -1005,14 +839,6 @@ function cleanup() {
 process.on("exit", cleanup);
 process.on("SIGINT", () => { cleanup(); process.exit(0); });
 process.on("SIGHUP", () => { cleanup(); process.exit(0); });
-server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    try {
-        return await dispatchToolCall(request.params.name, request.params.arguments);
-    }
-    catch (error) {
-        return errorResponse(error);
-    }
-});
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);

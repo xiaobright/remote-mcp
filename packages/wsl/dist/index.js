@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { asRecord, errorResponse, optionalNumber, optionalString, rejectUnexpectedParams, requireStringParam, } from "@remote-mcp/shared/mcp";
+import { errorResponse } from "@remote-mcp/shared/mcp";
 import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
 import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, runWslRawScript, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, startPersistentJob, getPersistentJobStatus, readPersistentJobOutput, waitPersistentJob, cancelPersistentJob, listPersistentJobs, } from "./wsl.js";
 const server = new McpServer({
@@ -15,7 +14,7 @@ function formatDistro(distro) {
 }
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
-const wslFileToolHandlers = registerRemoteFileTools({
+registerRemoteFileTools({
     server,
     prefix: "wsl_file",
     titlePrefix: "WSL",
@@ -28,7 +27,7 @@ const wslFileToolHandlers = registerRemoteFileTools({
             .describe("Timeout for each underlying WSL shell operation."),
     },
     makeRunner: (params) => (script) => runWslRawScript(script, {
-        timeoutMs: optionalNumber(params.timeout_ms),
+        timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : undefined,
     }),
 });
 function formatCommandResult(result) {
@@ -328,133 +327,8 @@ async function runScriptTool(params) {
     const result = await execWslScript(params.script, shell, params.workdir, { timeoutMs: params.timeout_ms });
     return { content: [{ type: "text", text: formatCommandResult(result) }], structuredContent: result };
 }
-function optionalRunMode(value) {
-    return value === "sync" || value === "async" || value === "watch" ? value : undefined;
-}
-function optionalTimeoutBehavior(value) {
-    return value === "kill" || value === "detach" ? value : undefined;
-}
-function optionalReadMode(value) {
-    return value === "delta" || value === "full" ? value : undefined;
-}
-const wslExecParams = [
-    "command",
-    "mode",
-    "on_timeout",
-    "read_mode",
-    "tail_chars",
-    "timeout_ms",
-    "workdir",
-];
-const wslScriptParams = [
-    "mode",
-    "on_timeout",
-    "script",
-    "shell",
-    "read_mode",
-    "tail_chars",
-    "timeout_ms",
-    "workdir",
-];
-const wslSessionParams = [
-    "action",
-    "distro",
-];
-const wslTaskParams = [
-    "action",
-    "stderrOffset",
-    "stdoutOffset",
-    "read_mode",
-    "tail_chars",
-    "taskId",
-    "wait_ms",
-];
-const wslJobParams = [
-    "action",
-    "command",
-    "jobId",
-    "max_runtime_ms",
-    "read_mode",
-    "stderrOffset",
-    "stdoutOffset",
-    "tail_chars",
-    "wait_ms",
-    "workdir",
-];
-async function dispatchToolCall(name, argsInput) {
-    const args = asRecord(argsInput);
-    const fileHandler = wslFileToolHandlers[name];
-    if (fileHandler) {
-        return fileHandler(args);
-    }
-    switch (name) {
-        case "wsl_session":
-            rejectUnexpectedParams(args, wslSessionParams, "wsl_session");
-            return handleSessionAction({
-                action: requireStringParam(args, "action", "wsl_session"),
-                distro: optionalString(args.distro),
-            });
-        case "wsl_task":
-            rejectUnexpectedParams(args, wslTaskParams, "wsl_task", {
-                tailChars: 'wsl_task expects "tail_chars"; camelCase "tailChars" is not supported.',
-            });
-            return handleTaskAction({
-                action: requireStringParam(args, "action", "wsl_task"),
-                taskId: optionalString(args.taskId),
-                waitMs: optionalNumber(args.wait_ms),
-                stdoutOffset: optionalNumber(args.stdoutOffset),
-                stderrOffset: optionalNumber(args.stderrOffset),
-                readMode: optionalReadMode(args.read_mode),
-                tailChars: optionalNumber(args.tail_chars),
-            });
-        case "wsl_exec":
-            rejectUnexpectedParams(args, wslExecParams, "wsl_exec", {
-                script: 'wsl_exec expects "command"; use wsl_script when you want the parameter to be named "script".',
-            });
-            return runCommandTool({
-                command: requireStringParam(args, "command", "wsl_exec"),
-                workdir: optionalString(args.workdir),
-                mode: optionalRunMode(args.mode),
-                timeout_ms: optionalNumber(args.timeout_ms),
-                on_timeout: optionalTimeoutBehavior(args.on_timeout),
-                read_mode: optionalReadMode(args.read_mode),
-                tail_chars: optionalNumber(args.tail_chars),
-            });
-        case "wsl_script":
-            rejectUnexpectedParams(args, wslScriptParams, "wsl_script", {
-                command: 'wsl_script expects "script"; use wsl_exec when you want the parameter to be named "command".',
-            });
-            return runScriptTool({
-                script: requireStringParam(args, "script", "wsl_script"),
-                shell: optionalString(args.shell),
-                workdir: optionalString(args.workdir),
-                mode: optionalRunMode(args.mode),
-                timeout_ms: optionalNumber(args.timeout_ms),
-                on_timeout: optionalTimeoutBehavior(args.on_timeout),
-                read_mode: optionalReadMode(args.read_mode),
-                tail_chars: optionalNumber(args.tail_chars),
-            });
-        case "wsl_job":
-            rejectUnexpectedParams(args, wslJobParams, "wsl_job");
-            return handleJobAction({
-                action: requireStringParam(args, "action", "wsl_job"),
-                command: optionalString(args.command),
-                jobId: optionalString(args.jobId),
-                workdir: optionalString(args.workdir),
-                maxRuntimeMs: optionalNumber(args.max_runtime_ms),
-                waitMs: optionalNumber(args.wait_ms),
-                stdoutOffset: optionalNumber(args.stdoutOffset),
-                stderrOffset: optionalNumber(args.stderrOffset),
-                readMode: optionalReadMode(args.read_mode),
-                tailChars: optionalNumber(args.tail_chars),
-            });
-        default:
-            return {
-                content: [{ type: "text", text: `Error: Tool ${name} not found` }],
-                isError: true,
-            };
-    }
-}
+// Tool invocations go only through registerTool callbacks so MCP SDK Zod
+// validation runs. Do not override CallToolRequestSchema on server.server.
 async function ensureInstalledDistro(distro) {
     const distros = await listDistros();
     if (distros.includes(distro)) {
@@ -838,14 +712,6 @@ Parameters:
             readMode: params.read_mode,
             tailChars: params.tail_chars,
         });
-    }
-    catch (error) {
-        return errorResponse(error);
-    }
-});
-server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    try {
-        return await dispatchToolCall(request.params.name, request.params.arguments);
     }
     catch (error) {
         return errorResponse(error);

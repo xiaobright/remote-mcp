@@ -40,6 +40,7 @@ WSL:
 - `wsl_exec`
 - `wsl_script`
 - `wsl_task`
+- `wsl_job` (persistent jobs via setsid; survive MCP restarts)
 - `wsl_file_read`
 - `wsl_file_write`
 - `wsl_file_edit`
@@ -54,6 +55,7 @@ SSH:
 - `ssh_exec`
 - `ssh_script`
 - `ssh_task`
+- `ssh_job` (persistent remote jobs via setsid; logs under `~/.remote-mcp/jobs/`)
 - `ssh_file_read`
 - `ssh_file_write`
 - `ssh_file_edit`

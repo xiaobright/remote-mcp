@@ -1,4 +1,5 @@
 export * from "./env.js";
+export * from "./fileLock.js";
 export * from "./mcp.js";
 export * from "./process.js";
 export * from "./persistentJobs.js";

@@ -5,7 +5,8 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv, readStringArrayJsonEnv } from "@remote-mcp/shared/env";
-import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
+import { withFileLock } from "@remote-mcp/shared/fileLock";
+import { killProcessTree, windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
 import { buildEnvPreamble, buildWorkdirPreamble, validateShell, } from "@remote-mcp/shared/shell";
 import { ProcessTaskManager, } from "@remote-mcp/shared/task-manager";
 import { buildPersistentJobCancelScript, buildPersistentJobInspectScript, buildPersistentJobRunnerScript, getPersistentJob, listPersistentJobs as listPersistentJobsFromStore, parsePersistentJobInspect, resolveDefaultPersistentJobStorePath, touchPersistentJob, upsertPersistentJob, } from "@remote-mcp/shared/persistentJobs";
@@ -181,9 +182,16 @@ function readDeviceStore() {
     deviceStoreCache = { version: 1, devices };
     return deviceStoreCache;
 }
-function writeDeviceStore(store) {
-    writeFileSync(DEVICE_STORE_PATH, `${JSON.stringify(store, null, 2)}\n`, "utf8");
-    deviceStoreCache = store;
+function mutateDeviceStore(mutator) {
+    return withFileLock(DEVICE_STORE_PATH, () => {
+        // Bypass cache so concurrent MCP processes see the latest file.
+        deviceStoreCache = null;
+        const store = readDeviceStore();
+        mutator(store);
+        writeFileSync(DEVICE_STORE_PATH, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+        deviceStoreCache = store;
+        return store;
+    });
 }
 function deviceProfile(name) {
     const trimmed = name.trim();
@@ -232,17 +240,17 @@ function deviceSshOptions(profile) {
     return options;
 }
 function rememberResolvedDevice(profile, target) {
-    const store = readDeviceStore();
-    const current = store.devices[profile.name];
-    if (!current) {
-        return;
-    }
-    store.devices[profile.name] = {
-        ...current,
-        lastResolvedTarget: validateTargetLiteral(target),
-        lastSeen: nowIso(),
-    };
-    writeDeviceStore(store);
+    mutateDeviceStore((store) => {
+        const current = store.devices[profile.name];
+        if (!current) {
+            return;
+        }
+        store.devices[profile.name] = {
+            ...current,
+            lastResolvedTarget: validateTargetLiteral(target),
+            lastSeen: nowIso(),
+        };
+    });
 }
 function remoteShellArgs(shellInput, login = true) {
     const shell = validateShell(shellInput || DEFAULT_SHELL);
@@ -307,7 +315,7 @@ async function probeCandidateTarget(options, resolved) {
         let stderr = "";
         let settled = false;
         const timer = setTimeout(() => {
-            proc.kill();
+            killProcessTree(proc);
         }, TARGET_PROBE_TIMEOUT_MS);
         timer.unref();
         proc.stderr?.on("data", (data) => { stderr += data.toString(); });
@@ -404,27 +412,27 @@ export function getDevice(name) {
 }
 export function upsertDevice(profile) {
     const sanitized = sanitizeDeviceProfile(profile);
-    const store = readDeviceStore();
-    const existing = store.devices[sanitized.name];
-    store.devices[sanitized.name] = {
-        ...(existing ?? {}),
-        ...sanitized,
-        name: sanitized.name,
-    };
-    writeDeviceStore(store);
+    const store = mutateDeviceStore((s) => {
+        const existing = s.devices[sanitized.name];
+        s.devices[sanitized.name] = {
+            ...(existing ?? {}),
+            ...sanitized,
+            name: sanitized.name,
+        };
+    });
     return store.devices[sanitized.name];
 }
 export function removeDevice(name) {
     const deviceName = validateDeviceName(name);
-    const store = readDeviceStore();
-    if (!store.devices[deviceName]) {
-        throw new Error(`Unknown SSH device: ${deviceName}`);
-    }
-    delete store.devices[deviceName];
+    mutateDeviceStore((store) => {
+        if (!store.devices[deviceName]) {
+            throw new Error(`Unknown SSH device: ${deviceName}`);
+        }
+        delete store.devices[deviceName];
+    });
     if (currentDefaultTarget === deviceName) {
         currentDefaultTarget = null;
     }
-    writeDeviceStore(store);
     return getSshState();
 }
 export function candidateTargetsFor(target) {
@@ -457,7 +465,7 @@ export async function runSshRawScript(options) {
         let timer = null;
         timer = setTimeout(() => {
             timedOut = true;
-            proc.kill();
+            killProcessTree(proc);
         }, timeout.ms);
         timer.unref();
         proc.stdout?.on("data", (data) => { stdout.push(data); });
@@ -840,12 +848,28 @@ export async function waitPersistentJob(jobId, waitMs, options = {}) {
 }
 export async function cancelPersistentJob(jobId) {
     const record = requireSshJob(jobId);
+    if (record.state !== "running" && record.state !== "starting") {
+        return record;
+    }
     const script = buildPersistentJobCancelScript(jobId);
-    await runSshScript({
+    const result = await runSshScript({
         target: record.target,
         script,
         timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
     });
+    if (result.exitCode !== 0) {
+        // Re-inspect so we do not claim cancelled when the remote process still lives.
+        const refreshed = await refreshPersistentJobRecord(record);
+        if (refreshed.state === "running" || refreshed.state === "starting") {
+            throw new Error(`Failed to cancel persistent job ${jobId}: ${result.stderr.trim() || result.stdout.trim() || `ssh exit ${result.exitCode}`}`);
+        }
+        return refreshed;
+    }
+    const line = result.stdout.trim().split(/\r?\n/).find((entry) => entry.includes("\t")) ?? "";
+    const outcome = line.split("\t")[0] || "cancelled";
+    if (outcome === "already_dead") {
+        return refreshPersistentJobRecord(record);
+    }
     return touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, {
         state: "cancelled",
         endedAt: nowIso(),

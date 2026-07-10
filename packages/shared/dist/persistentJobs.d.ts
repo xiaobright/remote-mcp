@@ -97,8 +97,9 @@ export interface PersistentJobInspectResult {
 export declare function parsePersistentJobInspect(raw: string): PersistentJobInspectResult;
 /**
  * Builds a bash script that cancels a persistent job by sending SIGTERM to
- * its process group. Prefers the pgid file, falling back to runner.pid (which
- * equals the PGID for a setsid session leader).
+ * its process group. Prefers runner.pid (session leader written from inside
+ * setsid) over the pgid file. Verifies the process is gone before claiming
+ * success; does not mark cancelled if the kill target is still alive.
  */
 export declare function buildPersistentJobCancelScript(jobId: string): string;
 //# sourceMappingURL=persistentJobs.d.ts.map

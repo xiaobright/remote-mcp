@@ -554,36 +554,64 @@ Rules:
         });
         const runner = options.makeRunner(params);
         const textEncoding = requestedEncoding(params);
+        const dryRun = Boolean(params.dry_run);
         const parsed = parsePatch(requireStringParam(params, "patch", toolName));
         const operations = parsed.operations;
-        const summaries = [];
         const warnings: PatchApplyWarning[] = [];
+
+        // Phase 1: fully plan in memory (read + match). No remote writes yet.
+        // Multi-file patches either all plan successfully or fail before any write.
+        type PlannedOp =
+          | {
+            kind: "add";
+            path: string;
+            content: string;
+            encoding: string;
+            added: number;
+            summary: Record<string, unknown>;
+          }
+          | {
+            kind: "update";
+            path: string;
+            content: string;
+            encoding: string;
+            expectedSha256: string;
+            added: number;
+            removed: number;
+            summary: Record<string, unknown>;
+          };
+
+        const planned: PlannedOp[] = [];
 
         for (const operation of operations) {
           const path = resolvePath(params.root, operation.path);
           if (operation.kind === "add") {
             const content = textForAddedFile(operation.lines ?? []);
             const writeEncoding = isAutoEncoding(textEncoding) ? "utf-8" : textEncoding;
-            if (!params.dry_run) {
-              await writeTextFile(runner, {
-                path,
-                content,
-                overwrite: false,
-                createParents: true,
-                encoding: writeEncoding,
-              });
+            if (!dryRun) {
+              const info = await statPath(runner, path);
+              if (info.exists) {
+                throw new Error(`Add File refused: path already exists: ${path}`);
+              }
             }
             const bytes = encodeRemoteText(content, writeEncoding);
-            summaries.push({
+            planned.push({
+              kind: "add",
               path,
-              action: "add",
-              added: operation.lines?.length ?? 0,
-              removed: 0,
-              bytes: bytes.length,
-              sha256: sha256Bytes(bytes),
-              dryRun: params.dry_run ?? false,
+              content,
               encoding: writeEncoding,
-              requestedEncoding: textEncoding,
+              added: operation.lines?.length ?? 0,
+              summary: {
+                path,
+                action: "add",
+                added: operation.lines?.length ?? 0,
+                removed: 0,
+                bytes: bytes.length,
+                sha256: sha256Bytes(bytes),
+                dryRun,
+                encoding: writeEncoding,
+                requestedEncoding: textEncoding,
+              },
             });
             continue;
           }
@@ -594,53 +622,81 @@ Rules:
           });
           const applied = applyUpdatePatch(original.text, operation.hunks ?? [], path);
           warnings.push(...applied.warnings);
-          if (!params.dry_run) {
+          const bytes = encodeRemoteText(applied.text, original.encoding);
+          planned.push({
+            kind: "update",
+            path,
+            content: applied.text,
+            encoding: original.encoding,
+            expectedSha256: original.sha256,
+            added: applied.added,
+            removed: applied.removed,
+            summary: {
+              path,
+              action: "update",
+              added: applied.added,
+              removed: applied.removed,
+              bytes: bytes.length,
+              sha256: sha256Bytes(bytes),
+              dryRun,
+              oldSha256: original.sha256,
+              encoding: original.encoding,
+              requestedEncoding: textEncoding,
+              detectedEncoding: original.detectedEncoding,
+              encodingConfidence: original.confidence,
+              encodingWarning: original.warning,
+            },
+          });
+        }
+
+        // Phase 2: write only after every operation planned successfully.
+        if (!dryRun) {
+          for (const item of planned) {
             try {
-              await writeTextFile(runner, {
-                path,
-                content: applied.text,
-                overwrite: true,
-                createParents: false,
-                expectedSha256: original.sha256,
-                encoding: original.encoding,
-              });
+              if (item.kind === "add") {
+                await writeTextFile(runner, {
+                  path: item.path,
+                  content: item.content,
+                  overwrite: false,
+                  createParents: true,
+                  encoding: item.encoding,
+                });
+              } else {
+                await writeTextFile(runner, {
+                  path: item.path,
+                  content: item.content,
+                  overwrite: true,
+                  createParents: false,
+                  expectedSha256: item.expectedSha256,
+                  encoding: item.encoding,
+                });
+              }
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
-              if (message.includes("sha256 mismatch")) {
-                const current = await readTextFileDecoded(runner, path, {
+              if (item.kind === "update" && message.includes("sha256 mismatch")) {
+                const current = await readTextFileDecoded(runner, item.path, {
                   maxBytes: maxBytes(params),
                   encoding: textEncoding,
                 });
-                return shaMismatchResponse(path, original.sha256, current);
+                return shaMismatchResponse(item.path, item.expectedSha256, current);
               }
-              throw error;
+              // Partial writes may have occurred after the first successful write.
+              throw new Error(
+                `${message} (patch write phase failed at ${item.path}; earlier files in this patch may already have been written)`,
+              );
             }
           }
-          const bytes = encodeRemoteText(applied.text, original.encoding);
-          summaries.push({
-            path,
-            action: "update",
-            added: applied.added,
-            removed: applied.removed,
-            bytes: bytes.length,
-            sha256: sha256Bytes(bytes),
-            dryRun: params.dry_run ?? false,
-            oldSha256: original.sha256,
-            encoding: original.encoding,
-            requestedEncoding: textEncoding,
-            detectedEncoding: original.detectedEncoding,
-            encodingConfidence: original.confidence,
-            encodingWarning: original.warning,
-          });
         }
+
+        const summaries = planned.map((item) => item.summary);
 
         return {
           content: [{
             type: "text" as const,
             text: [
               ...summaries.map((item) => {
-              const mode = item.dryRun ? "would " : "";
-              return `${mode}${item.action} ${item.path} (+${item.added}/-${item.removed}) sha256=${item.sha256}`;
+                const mode = item.dryRun ? "would " : "";
+                return `${mode}${item.action} ${item.path} (+${item.added}/-${item.removed}) sha256=${item.sha256}`;
               }),
               ...formatPatchWarnings(parsed.normalizations, warnings),
             ].join("\n"),

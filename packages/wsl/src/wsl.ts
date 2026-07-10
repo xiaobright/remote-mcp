@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { boundedDuration as sharedBoundedDuration, readPositiveIntEnv } from "@remote-mcp/shared/env";
-import { windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
+import { killProcessTree, windowsHiddenSpawnOptions } from "@remote-mcp/shared/process";
 import { buildWorkdirPreamble } from "@remote-mcp/shared/shell";
 import {
   buildPersistentJobCancelScript,
@@ -375,7 +375,7 @@ function stopSessionUnlocked(): WslSessionState {
 
   if (active) {
     expectedKeepaliveExits.add(active);
-    active.kill();
+    killProcessTree(active);
     keepalive = null;
   }
 
@@ -481,7 +481,7 @@ async function spawnWslCommandRaw(cmdArgs: string[], input: string, options: Wsl
 
       timer = setTimeout(() => {
         timedOut = true;
-        proc.kill();
+        killProcessTree(proc);
       }, timeout.ms);
       timer.unref();
 
@@ -756,7 +756,7 @@ async function spawnWslOnce(cmdArgs: string[], input: string, timeoutMs = PERSIS
     let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill();
+      killProcessTree(proc);
     }, timeoutMs);
     timer.unref();
     proc.stdout?.on("data", (data: Buffer) => { stdout.push(data); });
@@ -820,7 +820,7 @@ async function spawnWslOnceForDistro(
     let settled = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      proc.kill();
+      killProcessTree(proc);
     }, timeoutMs);
     timer.unref();
     proc.stdout?.on("data", (data: Buffer) => { stdout.push(data); });
@@ -1049,8 +1049,25 @@ export async function waitPersistentJob(
 
 export async function cancelPersistentJob(jobId: string): Promise<PersistentJobRecord> {
   const record = requireWslJob(jobId);
+  if (record.state !== "running" && record.state !== "starting") {
+    return record;
+  }
   const script = buildPersistentJobCancelScript(jobId);
-  await execWslScriptForDistro(script, record.configuredDistro);
+  const result = await execWslScriptForDistro(script, record.configuredDistro);
+  if (result.exitCode !== 0) {
+    const refreshed = await refreshPersistentJobRecord(record);
+    if (refreshed.state === "running" || refreshed.state === "starting") {
+      throw new Error(
+        `Failed to cancel persistent job ${jobId}: ${result.stderr.trim() || result.stdout.trim() || `wsl exit ${result.exitCode}`}`,
+      );
+    }
+    return refreshed;
+  }
+  const line = result.stdout.trim().split(/\r?\n/).find((entry) => entry.includes("\t")) ?? "";
+  const outcome = line.split("\t")[0] || "cancelled";
+  if (outcome === "already_dead") {
+    return refreshPersistentJobRecord(record);
+  }
   return touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, {
     state: "cancelled",
     endedAt: nowIso(),

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { killProcessTree } from "./process.js";
 function nowIso() {
     return new Date().toISOString();
 }
@@ -135,9 +136,9 @@ export class ProcessTaskManager {
         const task = this.getTask(taskId);
         if (task.state === "running" && task.proc) {
             task.state = "cancelled";
-            task.endedAt = nowIso();
-            task.proc.kill();
-            task.resolveFinished();
+            task.endedAt ??= nowIso();
+            // Kill the tree; let the close handler settle finished/exitCode.
+            killProcessTree(task.proc);
         }
         return this.snapshot(task);
     }
@@ -145,9 +146,8 @@ export class ProcessTaskManager {
         for (const task of this.tasks.values()) {
             if (task.state === "running" && task.proc) {
                 task.state = "cancelled";
-                task.endedAt = nowIso();
-                task.proc.kill();
-                task.resolveFinished();
+                task.endedAt ??= nowIso();
+                killProcessTree(task.proc);
             }
         }
     }

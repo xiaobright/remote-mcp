@@ -1,0 +1,53 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { dirnameScript, joinRemotePath, shellQuote, validateEnvName, validateShell } from "./shell.js";
+
+describe("shellQuote", () => {
+  it("wraps simple values", () => {
+    assert.equal(shellQuote("hello"), "'hello'");
+  });
+
+  it("escapes single quotes", () => {
+    assert.equal(shellQuote("a'b"), `'a'\\''b'`);
+  });
+});
+
+describe("dirnameScript", () => {
+  it("handles root-level paths by setting dir to /", () => {
+    const script = dirnameScript("path", "dir");
+    assert.match(script, /elif \[ -z "\$dir" \]; then dir=\//);
+  });
+
+  it("uses . for paths without a slash", () => {
+    const script = dirnameScript("path", "dir");
+    assert.match(script, /then dir=\./);
+  });
+});
+
+describe("joinRemotePath", () => {
+  it("joins relative paths under root", () => {
+    assert.equal(joinRemotePath("/home/a", "proj/x"), "/home/a/proj/x");
+  });
+
+  it("keeps absolute paths", () => {
+    assert.equal(joinRemotePath("/home/a", "/etc/hosts"), "/etc/hosts");
+  });
+});
+
+describe("validateShell / validateEnvName", () => {
+  it("accepts safe shell paths", () => {
+    assert.equal(validateShell("/bin/bash"), "/bin/bash");
+  });
+
+  it("rejects unsafe shell values", () => {
+    assert.throws(() => validateShell("bash; rm -rf /"), /Unsafe shell/);
+  });
+
+  it("accepts valid env names", () => {
+    assert.equal(validateEnvName("FOO_BAR"), "FOO_BAR");
+  });
+
+  it("rejects invalid env names", () => {
+    assert.throws(() => validateEnvName("1FOO"), /Unsafe environment/);
+  });
+});

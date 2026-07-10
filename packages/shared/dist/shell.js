@@ -15,7 +15,13 @@ export function joinRemotePath(root, path) {
     return `${root.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
 }
 export function dirnameScript(pathVar, outVar) {
-    return `${outVar}=\${${pathVar}%/*}\nif [ "$${outVar}" = "$${pathVar}" ]; then ${outVar}=.; fi`;
+    // ${path%/*} yields empty for root-level paths like /foo; treat that as /.
+    return [
+        `${outVar}=\${${pathVar}%/*}`,
+        `if [ "$${outVar}" = "$${pathVar}" ]; then ${outVar}=.`,
+        `elif [ -z "$${outVar}" ]; then ${outVar}=/`,
+        `fi`,
+    ].join("\n");
 }
 export function validateShell(shell) {
     const trimmed = shell.trim();
