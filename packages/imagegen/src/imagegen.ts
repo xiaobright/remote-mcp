@@ -3,6 +3,8 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync, readFileSync as readFileSyncFs } from "node:fs";
 import { basename, dirname, extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { readPositiveIntEnv } from "@remote-mcp/shared/env";
 
 function loadDotEnv(path: string | undefined): void {
   if (!path || !existsSync(path)) {
@@ -29,26 +31,19 @@ function loadDotEnv(path: string | undefined): void {
 const packageEnvFile = resolve(dirname(fileURLToPath(import.meta.url)), "..", ".env");
 loadDotEnv(process.env.IMAGEGEN_MCP_ENV_FILE ?? packageEnvFile);
 
-function positiveInt(name: string, fallback: number, max?: number): number {
-  const value = Number.parseInt(process.env[name] ?? "", 10);
-  if (!Number.isFinite(value) || value < 1) {
-    return fallback;
-  }
-  return max ? Math.min(value, max) : value;
-}
-
 export const imagegenConfig = {
   apiKey: process.env.OPENAI_API_KEY ?? "",
   baseUrl: (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, ""),
   model: process.env.IMAGEGEN_MCP_MODEL ?? "gpt-image-2",
   outputDir: resolve(process.env.IMAGEGEN_MCP_OUTPUT_DIR ?? resolve(process.cwd(), "output", "imagegen")),
-  concurrency: positiveInt("IMAGEGEN_MCP_CONCURRENCY", 3, 25),
-  maxAttempts: positiveInt("IMAGEGEN_MCP_MAX_ATTEMPTS", 3, 10),
-  requestTimeoutMs: positiveInt("IMAGEGEN_MCP_REQUEST_TIMEOUT_MS", 600_000),
-  defaultSyncTimeoutMs: positiveInt("IMAGEGEN_MCP_DEFAULT_SYNC_TIMEOUT_MS", 600_000),
-  defaultWatchTimeoutMs: positiveInt("IMAGEGEN_MCP_DEFAULT_WATCH_TIMEOUT_MS", 120_000),
-  minPollIntervalMs: positiveInt("IMAGEGEN_MCP_MIN_POLL_INTERVAL_MS", 20_000),
-  maxFinishedTasks: positiveInt("IMAGEGEN_MCP_MAX_FINISHED_TASKS", 100),
+  concurrency: readPositiveIntEnv("IMAGEGEN_MCP_CONCURRENCY", 3, 25),
+  maxAttempts: readPositiveIntEnv("IMAGEGEN_MCP_MAX_ATTEMPTS", 3, 10),
+  requestTimeoutMs: readPositiveIntEnv("IMAGEGEN_MCP_REQUEST_TIMEOUT_MS", 600_000),
+  defaultSyncTimeoutMs: readPositiveIntEnv("IMAGEGEN_MCP_DEFAULT_SYNC_TIMEOUT_MS", 600_000),
+  defaultWatchTimeoutMs: readPositiveIntEnv("IMAGEGEN_MCP_DEFAULT_WATCH_TIMEOUT_MS", 120_000),
+  maxWaitMs: readPositiveIntEnv("IMAGEGEN_MCP_MAX_WAIT_MS", 1_500_000),
+  minPollIntervalMs: readPositiveIntEnv("IMAGEGEN_MCP_MIN_POLL_INTERVAL_MS", 20_000),
+  maxFinishedTasks: readPositiveIntEnv("IMAGEGEN_MCP_MAX_FINISHED_TASKS", 100),
 };
 
 export type ImageOperation = "generate" | "edit";
@@ -113,6 +108,13 @@ export interface ImageTaskSnapshot {
   outputDir: string;
 }
 
+export interface ImagePollInfo {
+  throttled: boolean;
+  waitedMs: number;
+  minPollIntervalMs: number;
+  recommendedAction: string;
+}
+
 interface ManagedImageTask {
   taskId: string;
   state: ImageTaskState;
@@ -131,6 +133,8 @@ interface ManagedImageTask {
   result: ImageJobResult | BatchResult | null;
   finished: Promise<void>;
   resolveFinished: () => void;
+  lastObservationAt: number | null;
+  observationLock: Promise<void>;
 }
 
 function nowIso(): string {
@@ -218,16 +222,15 @@ async function parseApiResponse(response: Response): Promise<{ data?: Array<{ b6
   return parsed as { data?: Array<{ b64_json?: string }> };
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, label: string): Promise<{ data?: Array<{ b64_json?: string }> }> {
+async function fetchWithRetry(url: string, init: RequestInit, label: string, externalSignal: AbortSignal): Promise<{ data?: Array<{ b64_json?: string }> }> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= imagegenConfig.maxAttempts; attempt += 1) {
-    const controller = init.signal as AbortSignal | undefined;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), imagegenConfig.requestTimeoutMs);
     try {
       const response = await fetch(url, {
         ...init,
-        signal: controller ? AbortSignal.any([controller, timeout.signal]) : timeout.signal,
+        signal: AbortSignal.any([externalSignal, timeout.signal]),
       });
       if (response.ok) return await parseApiResponse(response);
       const body = await response.text();
@@ -238,11 +241,11 @@ async function fetchWithRetry(url: string, init: RequestInit, label: string): Pr
       const delayMs = Number.isFinite(retryAfter) ? Math.min(retryAfter * 1000, 60_000) : Math.min(60_000, 2 ** attempt * 1000);
       await new Promise((resolveDelay, rejectDelay) => {
         const timerId = setTimeout(resolveDelay, delayMs);
-        controller?.addEventListener("abort", () => { clearTimeout(timerId); rejectDelay(new Error("cancelled")); }, { once: true });
+        externalSignal.addEventListener("abort", () => { clearTimeout(timerId); rejectDelay(new Error("cancelled")); }, { once: true });
       });
     } catch (error) {
       lastError = error;
-      if (controller?.aborted || (error instanceof Error && error.message === "cancelled")) throw error;
+      if (externalSignal.aborted || (error instanceof Error && error.message === "cancelled")) throw error;
       if (attempt === imagegenConfig.maxAttempts) throw new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`);
       await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(60_000, 2 ** attempt * 1000)));
     } finally {
@@ -265,8 +268,7 @@ async function callGenerate(spec: ImageJobSpec, signal: AbortSignal): Promise<st
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
-    signal,
-  }, "generation");
+  }, "generation", signal);
   return (response.data ?? []).map((item) => item.b64_json ?? "").filter(Boolean);
 }
 
@@ -287,8 +289,7 @@ async function callEdit(spec: ImageJobSpec, signal: AbortSignal): Promise<string
     method: "POST",
     headers: { Authorization: `Bearer ${imagegenConfig.apiKey}` },
     body: form,
-    signal,
-  }, "edit");
+  }, "edit", signal);
   return (response.data ?? []).map((item) => item.b64_json ?? "").filter(Boolean);
 }
 
@@ -376,6 +377,8 @@ export class ImageTaskManager {
       result: null,
       finished: latch.finished,
       resolveFinished: latch.resolveFinished,
+      lastObservationAt: null,
+      observationLock: Promise.resolve(),
     };
     this.tasks.set(taskId, task);
     this.queue.push(taskId);
@@ -388,6 +391,11 @@ export class ImageTaskManager {
   }
 
   status(taskId: string): ImageTaskSnapshot { return this.snapshot(this.get(taskId)); }
+
+  async observeStatus(taskId: string): Promise<{ snapshot: ImageTaskSnapshot; poll: ImagePollInfo }> {
+    const task = this.get(taskId);
+    return this.withObservationThrottle(task, (poll) => ({ snapshot: this.snapshot(task), poll }));
+  }
 
   result(taskId: string): ImageJobResult | BatchResult | null { return this.get(taskId).result; }
 
@@ -474,6 +482,36 @@ export class ImageTaskManager {
     const extra = finished.length - imagegenConfig.maxFinishedTasks;
     if (extra <= 0) return;
     finished.sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(0, extra).forEach((task) => this.tasks.delete(task.taskId));
+  }
+
+  private async withObservationThrottle<T>(
+    task: ManagedImageTask,
+    fn: (poll: ImagePollInfo) => T,
+  ): Promise<T> {
+    const previous = task.observationLock;
+    let release!: () => void;
+    task.observationLock = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+
+    await previous;
+    try {
+      const now = Date.now();
+      const elapsed = task.lastObservationAt === null ? imagegenConfig.minPollIntervalMs : now - task.lastObservationAt;
+      const active = task.state === "queued" || task.state === "running";
+      const waitMs = active ? Math.max(0, imagegenConfig.minPollIntervalMs - elapsed) : 0;
+      if (waitMs > 0) {
+        await delay(waitMs);
+      }
+
+      task.lastObservationAt = Date.now();
+      return fn({
+        throttled: waitMs > 0,
+        waitedMs: waitMs,
+        minPollIntervalMs: imagegenConfig.minPollIntervalMs,
+        recommendedAction: "Prefer imagegen_task action=wait over polling action=status.",
+      });
+    } finally {
+      release();
+    }
   }
 
   private get(taskId: string): ManagedImageTask {

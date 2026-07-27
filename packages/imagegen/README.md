@@ -32,9 +32,15 @@ IMAGEGEN_MCP_MAX_ATTEMPTS=3
 IMAGEGEN_MCP_REQUEST_TIMEOUT_MS=600000
 IMAGEGEN_MCP_DEFAULT_SYNC_TIMEOUT_MS=600000
 IMAGEGEN_MCP_DEFAULT_WATCH_TIMEOUT_MS=120000
+IMAGEGEN_MCP_MAX_WAIT_MS=1500000
 IMAGEGEN_MCP_MIN_POLL_INTERVAL_MS=20000
 IMAGEGEN_MCP_MAX_FINISHED_TASKS=100
 ```
+
+`IMAGEGEN_MCP_MAX_WAIT_MS` 是单次工具调用等待的上限（默认 25 分钟），`timeout_ms` / `wait_ms`
+超过它会被钳制并在返回里标记 `timeoutClamped` / `waitClamped`。运行中的任务通过
+`imagegen_task action=status|output` 轮询时会按 `IMAGEGEN_MCP_MIN_POLL_INTERVAL_MS` 节流，
+与 `wsl` / `ssh` 的 task 轮询行为一致；建议优先用 `action=wait`。
 
 `IMAGEGEN_MCP_MODEL` 不会出现在任何 MCP 工具参数中，模型只能表达生成/编辑意图。
 

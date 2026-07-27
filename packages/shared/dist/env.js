@@ -1,10 +1,8 @@
-export function readPositiveIntEnv(name, fallback) {
+export function readPositiveIntEnv(name, fallback, max) {
     const raw = process.env[name]?.trim();
-    if (!raw) {
-        return fallback;
-    }
-    const value = Number.parseInt(raw, 10);
-    return Number.isFinite(value) && value > 0 ? value : fallback;
+    const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+    const value = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    return typeof max === "number" ? Math.min(value, max) : value;
 }
 export function readStringArrayJsonEnv(name) {
     const raw = process.env[name]?.trim();

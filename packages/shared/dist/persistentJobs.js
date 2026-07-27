@@ -1,12 +1,9 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync, } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { readPositiveIntEnv } from "./env.js";
 import { withFileLock } from "./fileLock.js";
 function nowIso() {
     return new Date().toISOString();
-}
-function readPositiveIntEnv(name, fallback) {
-    const value = Number.parseInt(process.env[name] ?? "", 10);
-    return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 const STORE_LOCK_WAIT_MS = readPositiveIntEnv("REMOTE_MCP_PERSISTENT_JOB_STORE_LOCK_WAIT_MS", 5000);
 const STORE_LOCK_STALE_MS = readPositiveIntEnv("REMOTE_MCP_PERSISTENT_JOB_STORE_LOCK_STALE_MS", 30000);

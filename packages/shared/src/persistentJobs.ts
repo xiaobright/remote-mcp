@@ -5,6 +5,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { readPositiveIntEnv } from "./env.js";
 import { withFileLock } from "./fileLock.js";
 
 export type PersistentJobBackend = "wsl" | "ssh";
@@ -45,11 +46,6 @@ export interface PersistentJobStore {
 
 function nowIso(): string {
   return new Date().toISOString();
-}
-
-function readPositiveIntEnv(name: string, fallback: number): number {
-  const value = Number.parseInt(process.env[name] ?? "", 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 const STORE_LOCK_WAIT_MS = readPositiveIntEnv("REMOTE_MCP_PERSISTENT_JOB_STORE_LOCK_WAIT_MS", 5000);

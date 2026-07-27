@@ -8,6 +8,7 @@ export declare const imagegenConfig: {
     requestTimeoutMs: number;
     defaultSyncTimeoutMs: number;
     defaultWatchTimeoutMs: number;
+    maxWaitMs: number;
     minPollIntervalMs: number;
     maxFinishedTasks: number;
 };
@@ -66,6 +67,12 @@ export interface ImageTaskSnapshot {
     failed: number;
     outputDir: string;
 }
+export interface ImagePollInfo {
+    throttled: boolean;
+    waitedMs: number;
+    minPollIntervalMs: number;
+    recommendedAction: string;
+}
 export declare class ImageTaskManager {
     private readonly tasks;
     private readonly queue;
@@ -73,6 +80,10 @@ export declare class ImageTaskManager {
     start(spec: ImageJobSpec | ImageJobSpec[]): ImageTaskSnapshot;
     list(): ImageTaskSnapshot[];
     status(taskId: string): ImageTaskSnapshot;
+    observeStatus(taskId: string): Promise<{
+        snapshot: ImageTaskSnapshot;
+        poll: ImagePollInfo;
+    }>;
     result(taskId: string): ImageJobResult | BatchResult | null;
     wait(taskId: string, waitMs: number): Promise<{
         snapshot: ImageTaskSnapshot;
@@ -88,6 +99,7 @@ export declare class ImageTaskManager {
     private pump;
     private run;
     private pruneFinished;
+    private withObservationThrottle;
     private get;
     private snapshot;
 }

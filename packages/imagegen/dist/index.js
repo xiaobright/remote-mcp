@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { errorResponse } from "@remote-mcp/shared/mcp";
+import { boundedDuration } from "@remote-mcp/shared/env";
 import { imagegenConfig, ImageTaskManager, readArtifactBase64, validateConfiguration, } from "./imagegen.js";
 const server = new McpServer({ name: "imagegen-mcp-server", version: "0.1.0" });
 const manager = new ImageTaskManager();
@@ -32,14 +33,15 @@ function responseForSnapshot(snapshot, extra = {}) {
         structuredContent: { ...snapshot, ...extra },
     };
 }
-async function responseForResult(taskId, includeImages, maxImages) {
+async function responseForResult(taskId, includeImages, maxImages, poll) {
     const snapshot = manager.status(taskId);
     const result = manager.result(taskId);
+    const pollInfo = poll ? { poll } : {};
     const content = [
         { type: "text", text: snapshotText(snapshot) },
     ];
     if (!result)
-        return { content, structuredContent: { ...snapshot } };
+        return { content, structuredContent: { ...snapshot, ...pollInfo } };
     const artifacts = "artifacts" in result ? result.artifacts : result.items.flatMap((item) => item.artifacts);
     const limitedArtifacts = artifacts.slice(0, Math.max(0, Math.min(maxImages, 20)));
     if (includeImages) {
@@ -47,20 +49,23 @@ async function responseForResult(taskId, includeImages, maxImages) {
             content.push({ type: "image", data: await readArtifactBase64(artifact.path), mimeType: artifact.mimeType });
         }
     }
-    return { content, structuredContent: { ...snapshot, result } };
+    return { content, structuredContent: { ...snapshot, result, ...pollInfo } };
 }
 async function runMode(spec, mode, timeoutMs, onTimeout, includeImages = true) {
     const snapshot = manager.start(spec);
     if (mode === "async")
         return responseForSnapshot(snapshot, { nextAction: "Use imagegen_task with action=status, wait, or output." });
-    const waitMs = timeoutMs ?? (mode === "sync" ? imagegenConfig.defaultSyncTimeoutMs : imagegenConfig.defaultWatchTimeoutMs);
-    const waited = await manager.wait(snapshot.taskId, waitMs);
+    const bounded = boundedDuration(timeoutMs, mode === "sync" ? imagegenConfig.defaultSyncTimeoutMs : imagegenConfig.defaultWatchTimeoutMs, imagegenConfig.maxWaitMs);
+    const timeoutInfo = { timeoutMs: bounded.ms };
+    if (bounded.clamped)
+        Object.assign(timeoutInfo, { requestedTimeoutMs: bounded.requestedMs, timeoutClamped: true, maxTimeoutMs: bounded.maxMs });
+    const waited = await manager.wait(snapshot.taskId, bounded.ms);
     if (!waited.completed && (mode === "sync" || onTimeout === "kill")) {
         const cancelled = manager.cancel(snapshot.taskId);
-        return responseForSnapshot(cancelled, { timedOut: true, waitedMs: waited.waitedMs });
+        return responseForSnapshot(cancelled, { timedOut: true, waitedMs: waited.waitedMs, ...timeoutInfo });
     }
     if (!waited.completed)
-        return responseForSnapshot(waited.snapshot, { timedOut: true, waitedMs: waited.waitedMs, nextAction: "Use imagegen_task with action=wait or output." });
+        return responseForSnapshot(waited.snapshot, { timedOut: true, waitedMs: waited.waitedMs, ...timeoutInfo, nextAction: "Use imagegen_task with action=wait or output." });
     return responseForResult(snapshot.taskId, includeImages, 10);
 }
 server.registerTool("imagegen_session", {
@@ -80,6 +85,8 @@ server.registerTool("imagegen_session", {
                 outputDir: imagegenConfig.outputDir,
                 concurrency: imagegenConfig.concurrency,
                 maxAttempts: imagegenConfig.maxAttempts,
+                maxWaitMs: imagegenConfig.maxWaitMs,
+                minPollIntervalMs: imagegenConfig.minPollIntervalMs,
                 ...manager.getActiveState(),
             },
         };
@@ -150,7 +157,7 @@ server.registerTool("imagegen_batch", {
 });
 server.registerTool("imagegen_task", {
     title: "Manage Image Generation Task",
-    description: "Manage image tasks using actions status, output, wait, cancel, and list. Use output with include_images=true only when the generated images should be returned into model context.",
+    description: "Manage image tasks using actions status, output, wait, cancel, and list. status/output polls on running tasks are throttled to the configured min poll interval; prefer action=wait. Use output with include_images=true only when the generated images should be returned into model context.",
     inputSchema: z.object({
         action: z.enum(["status", "output", "wait", "cancel", "list"]),
         taskId: z.string().min(1).optional(),
@@ -165,15 +172,24 @@ server.registerTool("imagegen_task", {
             return { content: [{ type: "text", text: manager.list().map(snapshotText).join("\n") || "No image tasks." }], structuredContent: { tasks: manager.list() } };
         if (!params.taskId)
             throw new Error(`taskId is required for action=${params.action}`);
-        if (params.action === "status")
-            return responseForSnapshot(manager.status(params.taskId));
+        if (params.action === "status") {
+            const observed = await manager.observeStatus(params.taskId);
+            return responseForSnapshot(observed.snapshot, { poll: observed.poll });
+        }
         if (params.action === "cancel")
             return responseForSnapshot(manager.cancel(params.taskId));
-        if (params.action === "output")
-            return await responseForResult(params.taskId, params.include_images ?? true, params.max_images ?? 10);
-        const waited = await manager.wait(params.taskId, params.wait_ms ?? imagegenConfig.defaultWatchTimeoutMs);
-        if (!waited.completed)
-            return responseForSnapshot(waited.snapshot, { timedOut: true, waitedMs: waited.waitedMs });
+        if (params.action === "output") {
+            const observed = await manager.observeStatus(params.taskId);
+            return await responseForResult(params.taskId, params.include_images ?? true, params.max_images ?? 10, observed.poll);
+        }
+        const bounded = boundedDuration(params.wait_ms, imagegenConfig.defaultWatchTimeoutMs, imagegenConfig.maxWaitMs);
+        const waited = await manager.wait(params.taskId, bounded.ms);
+        if (!waited.completed) {
+            const timeoutInfo = { timedOut: true, waitedMs: waited.waitedMs, waitMs: bounded.ms };
+            if (bounded.clamped)
+                Object.assign(timeoutInfo, { requestedWaitMs: bounded.requestedMs, waitClamped: true, maxWaitMs: bounded.maxMs });
+            return responseForSnapshot(waited.snapshot, timeoutInfo);
+        }
         return await responseForResult(params.taskId, params.include_images ?? true, params.max_images ?? 10);
     }
     catch (error) {

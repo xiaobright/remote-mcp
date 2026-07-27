@@ -1,4 +1,4 @@
-export declare function readPositiveIntEnv(name: string, fallback: number): number;
+export declare function readPositiveIntEnv(name: string, fallback: number, max?: number): number;
 export declare function readStringArrayJsonEnv(name: string): string[] | null;
 export declare function isPositiveInt(value: unknown): value is number;
 export interface BoundedDuration {
