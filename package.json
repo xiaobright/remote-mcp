@@ -12,13 +12,15 @@
   "workspaces": [
     "packages/shared",
     "packages/ssh",
-    "packages/wsl"
+    "packages/wsl",
+    "packages/imagegen"
   ],
   "scripts": {
-    "build": "npm --workspace @remote-mcp/shared run build && npm --workspace @remote-mcp/ssh run build && npm --workspace @remote-mcp/wsl run build",
+    "build": "npm --workspace @remote-mcp/shared run build && npm --workspace @remote-mcp/ssh run build && npm --workspace @remote-mcp/wsl run build && npm --workspace @remote-mcp/imagegen run build",
     "test": "npm run build && node --test packages/shared/dist/shell.test.js packages/shared/dist/persistentJobs.test.js packages/shared/dist/remote/edit.test.js packages/shared/dist/remote/patch.test.js",
     "start:ssh": "npm --workspace @remote-mcp/ssh start",
-    "start:wsl": "npm --workspace @remote-mcp/wsl start"
+    "start:wsl": "npm --workspace @remote-mcp/wsl start",
+    "start:imagegen": "npm --workspace @remote-mcp/imagegen start"
   },
   "engines": {
     "node": ">=18"
