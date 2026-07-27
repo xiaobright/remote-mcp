@@ -44,6 +44,8 @@ export type WslRunMode = "sync" | "async" | "watch";
 export type WslTimeoutBehavior = "kill" | "detach";
 export interface WslSyncOptions {
     timeoutMs?: number;
+    /** One-shot distro override; does not change the process session default. */
+    distro?: string | null;
 }
 export interface WslTaskPollInfo {
     throttled: boolean;
@@ -88,15 +90,15 @@ export declare function stopSessionSync(): WslSessionState;
 export declare function execWsl(command: string, workdir?: string, options?: WslSyncOptions): Promise<WslResult>;
 export declare function execWslScript(script: string, shell?: string, workdir?: string, options?: WslSyncOptions): Promise<WslResult>;
 export declare function runWslRawScript(script: string, options?: WslSyncOptions): Promise<WslRawResult>;
-export declare function execWslAsync(command: string, workdir?: string): Promise<WslTaskSnapshot>;
-export declare function execWslScriptAsync(script: string, shell?: string, workdir?: string): Promise<WslTaskSnapshot>;
+export declare function execWslAsync(command: string, workdir?: string, options?: Pick<WslSyncOptions, "distro">): Promise<WslTaskSnapshot>;
+export declare function execWslScriptAsync(script: string, shell?: string, workdir?: string, options?: Pick<WslSyncOptions, "distro">): Promise<WslTaskSnapshot>;
 export declare function listTasks(): WslTaskSnapshot[];
 export declare function getTaskStatus(taskId: string): WslTaskSnapshot;
 export declare function readTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number, readMode?: WslReadMode): WslTaskOutput;
 export declare function observeTaskStatus(taskId: string): Promise<WslTaskSnapshot>;
 export declare function observeTaskOutput(taskId: string, stdoutOffset?: number, stderrOffset?: number, tailChars?: number, readMode?: WslReadMode): Promise<WslTaskOutput>;
 export declare function waitTask(taskId: string, waitMs?: number, options?: WslTaskOutputOptions): Promise<WslTaskWaitResult>;
-export declare function watchWslTask(command: string, shell: string, workdir?: string, timeoutMs?: number, timeoutBehavior?: WslTimeoutBehavior, outputOptions?: WslTaskOutputOptions): Promise<WslWatchResult>;
+export declare function watchWslTask(command: string, shell: string, workdir?: string, timeoutMs?: number, timeoutBehavior?: WslTimeoutBehavior, outputOptions?: WslTaskOutputOptions, distro?: string | null): Promise<WslWatchResult>;
 export declare function cancelTask(taskId: string): WslTaskSnapshot;
 export declare function cancelAllTasksSync(): void;
 export declare function listDistros(): Promise<string[]>;
@@ -117,6 +119,7 @@ export declare function startPersistentJob(options: {
     command: string;
     workdir?: string;
     maxRuntimeMs?: number;
+    distro?: string | null;
 }): Promise<PersistentJobRecord>;
 export declare function getPersistentJobStatus(jobId: string): Promise<PersistentJobRecord>;
 export declare function readPersistentJobOutput(jobId: string, options?: {

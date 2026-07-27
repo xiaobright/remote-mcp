@@ -17,22 +17,20 @@ shell.
   - `list_distros`: list installed WSL distributions.
 - `wsl_exec`
   - Run a short command inside WSL.
+  - Optional `distro` one-shot override (does not change session default).
 - `wsl_script`
   - Run a multi-line WSL shell script through stdin.
   - Prefer this for pipes, redirects, here-docs, `$()`, `$VAR`, nested quotes,
     and anything more complex than one line.
+  - Optional `distro` one-shot override.
 - `wsl_task`
   - Manage async/watch tasks started by `wsl_exec` or `wsl_script`.
-- `wsl_file_edit`
-  - Replace exact text in one remote file.
-  - Defaults to one unique match; pass `replace_all=true` to replace every match.
-  - Also accepts `oldString`/`newString`/`replaceAll` aliases for clients whose
-    native edit tool uses camelCase.
-- `wsl_file_apply_patch`
-  - Apply Codex-style multi-file patches and add files.
-  - Blank or unmarked hunk lines are treated as context and reported in
-    `structuredContent.normalizations`.
-  - Hunks with no additions or removals are rejected to catch missing markers.
+- `wsl_job`
+  - Detached persistent jobs that survive MCP restarts; optional `distro` on start.
+- `wsl_file_*` (`read` / `write` / `edit` / `apply_patch` / `list` / `stat` / `search`)
+  - File tools inside the configured WSL distro; optional `distro` one-shot override.
+- Deletes under `/mnt` are blocked. Delete Windows-mounted paths on the host
+  (`Remove-Item -LiteralPath ...`), not through WSL.
 
 ## Execution Parameters
 

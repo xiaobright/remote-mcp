@@ -49,21 +49,32 @@ function formatDistro(distro: string | null): string {
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
 
+const distroField = z.string()
+  .optional()
+  .describe('Optional one-shot distro override (e.g. "Ubuntu-22.04"). Does not change the process session default. Pass "default" for system default.');
+
 registerRemoteFileTools({
   server,
   prefix: "wsl_file",
   titlePrefix: "WSL",
-  targetDescription: "Uses this MCP process's configured WSL distro and keepalive session.",
+  targetDescription: "Uses this MCP process's configured WSL distro and keepalive session. Optional distro overrides one call only.",
   targetFields: {
     timeout_ms: z.number()
       .int()
       .positive()
       .optional()
       .describe("Timeout for each underlying WSL shell operation."),
+    distro: distroField,
   },
-  makeRunner: (params) => (script) => runWslRawScript(script, {
-    timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : undefined,
-  }),
+  makeRunner: (params) => async (script) => {
+    const distro = await resolveRequestedDistro(
+      typeof params.distro === "string" ? params.distro : undefined,
+    );
+    return runWslRawScript(script, {
+      timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : undefined,
+      distro,
+    });
+  },
 });
 
 function formatCommandResult(result: {
@@ -309,16 +320,19 @@ async function handleJobAction(params: {
   stderrOffset?: number;
   tailChars?: number;
   readMode?: WslReadMode;
+  distro?: string;
 }) {
   switch (params.action) {
     case "start": {
       if (!params.command) {
         throw new Error("command is required for start");
       }
+      const distro = await resolveRequestedDistro(params.distro);
       const job = await startPersistentJob({
         command: params.command,
         workdir: params.workdir,
         maxRuntimeMs: params.maxRuntimeMs,
+        distro,
       });
       return {
         content: [{ type: "text" as const, text: formatPersistentJobStarted(job) }],
@@ -400,21 +414,31 @@ async function runCommandTool(params: {
   on_timeout?: WslTimeoutBehavior;
   tail_chars?: number;
   read_mode?: WslReadMode;
+  distro?: string;
 }) {
   const mode = params.mode ?? "sync";
+  const distro = await resolveRequestedDistro(params.distro);
   if (mode === "async") {
-    const task = await execWslAsync(params.command, params.workdir);
+    const task = await execWslAsync(params.command, params.workdir, { distro });
     return { content: [{ type: "text" as const, text: formatTaskStarted(task) }], structuredContent: task };
   }
   if (mode === "watch") {
-    const output = await watchWslTask(params.command, "bash", params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
-      tailChars: params.tail_chars,
-      readMode: params.read_mode,
-    });
+    const output = await watchWslTask(
+      params.command,
+      "bash",
+      params.workdir,
+      params.timeout_ms,
+      params.on_timeout ?? "detach",
+      {
+        tailChars: params.tail_chars,
+        readMode: params.read_mode,
+      },
+      distro,
+    );
     return { content: [{ type: "text" as const, text: formatTaskOutput(output) }], structuredContent: output };
   }
 
-  const result = await execWsl(params.command, params.workdir, { timeoutMs: params.timeout_ms });
+  const result = await execWsl(params.command, params.workdir, { timeoutMs: params.timeout_ms, distro });
   return { content: [{ type: "text" as const, text: formatCommandResult(result) }], structuredContent: result };
 }
 
@@ -427,22 +451,32 @@ async function runScriptTool(params: {
   on_timeout?: WslTimeoutBehavior;
   tail_chars?: number;
   read_mode?: WslReadMode;
+  distro?: string;
 }) {
   const shell = params.shell ?? "bash";
   const mode = params.mode ?? "sync";
+  const distro = await resolveRequestedDistro(params.distro);
   if (mode === "async") {
-    const task = await execWslScriptAsync(params.script, shell, params.workdir);
+    const task = await execWslScriptAsync(params.script, shell, params.workdir, { distro });
     return { content: [{ type: "text" as const, text: formatTaskStarted(task) }], structuredContent: task };
   }
   if (mode === "watch") {
-    const output = await watchWslTask(params.script, shell, params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
-      tailChars: params.tail_chars,
-      readMode: params.read_mode,
-    });
+    const output = await watchWslTask(
+      params.script,
+      shell,
+      params.workdir,
+      params.timeout_ms,
+      params.on_timeout ?? "detach",
+      {
+        tailChars: params.tail_chars,
+        readMode: params.read_mode,
+      },
+      distro,
+    );
     return { content: [{ type: "text" as const, text: formatTaskOutput(output) }], structuredContent: output };
   }
 
-  const result = await execWslScript(params.script, shell, params.workdir, { timeoutMs: params.timeout_ms });
+  const result = await execWslScript(params.script, shell, params.workdir, { timeoutMs: params.timeout_ms, distro });
   return { content: [{ type: "text" as const, text: formatCommandResult(result) }], structuredContent: result };
 }
 
@@ -625,9 +659,13 @@ Args:
     internally so the MCP client can still receive a timeout result.
   - on_timeout: for watch only, "detach" (default) or "kill".
   - tail_chars: for watch output, return only the tail of each stream.
+  - distro: optional one-shot distro override; does not change session default.
 
 Parameter names intentionally match ssh_exec/ssh_script. Start background work by
 passing mode="async" here.
+
+Deletes under /mnt are blocked on purpose: delete Windows paths on the host
+(PowerShell Remove-Item), not through WSL.
 
 Returns:
   sync: { stdout, stderr, exitCode, timedOut?, timeoutMs? }
@@ -639,6 +677,7 @@ Examples:
   - "cd /tmp && curl -s ifconfig.me"                  -> chain commands
   - "node -e 'console.log(2+2)'"                      -> inline script
   - workdir="/home/user/project" + "npm test"         -> run in project dir
+  - distro="Ubuntu-22.04" + "uname -a"                -> one-shot other distro
   - mode="watch", timeout_ms=120000 for builds that may take a while
 
 Error Handling:
@@ -671,6 +710,7 @@ Error Handling:
         .positive()
         .optional()
         .describe("For watch mode, return only the last N characters from each stream."),
+      distro: distroField,
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -687,6 +727,7 @@ Error Handling:
     on_timeout?: WslTimeoutBehavior;
     read_mode?: WslReadMode;
     tail_chars?: number;
+    distro?: string;
   }) => {
     try {
       return await runCommandTool(params);
@@ -723,9 +764,12 @@ Args:
     internally so the MCP client can still receive a timeout result.
   - on_timeout: for watch only, "detach" (default) or "kill".
   - tail_chars: for watch output, return only the tail of each stream.
+  - distro: optional one-shot distro override; does not change session default.
 
 Parameter names intentionally match ssh_exec/ssh_script. Start background work by
 passing mode="async" here.
+
+Deletes under /mnt are blocked on purpose: delete Windows paths on the host.
 
 Returns:
   Same as wsl_exec: sync command result, async task snapshot, or watch output.
@@ -734,6 +778,7 @@ Examples:
   - script="git status\\ngit log --oneline -3"        -> run multiple commands
   - script="for f in *.txt; do echo \$f; done"        -> shell loop
   - shell="zsh" + script="echo \$ZSH_VERSION"         -> use specific shell
+  - distro="Ubuntu-22.04" + script="df -h /"          -> one-shot other distro
   - mode="watch", timeout_ms=120000 for builds that may take a while
 
 Error Handling:
@@ -767,6 +812,7 @@ Error Handling:
         .positive()
         .optional()
         .describe("For watch mode, return only the last N characters from each stream."),
+      distro: distroField,
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -784,6 +830,7 @@ Error Handling:
     on_timeout?: WslTimeoutBehavior;
     read_mode?: WslReadMode;
     tail_chars?: number;
+    distro?: string;
   }) => {
     try {
       return await runScriptTool(params);
@@ -821,6 +868,7 @@ Parameters:
   - command (required for start): shell command to execute detached.
   - jobId (required for status/output/wait/cancel): UUID returned by start.
   - workdir (optional, for start): working directory inside WSL.
+  - distro (optional, for start): one-shot distro override for the job.
   - max_runtime_ms (optional, for start): auto-expire deadline. Default 1h.
   - wait_ms (optional, for wait): max poll duration. Default 30000.
   - stdoutOffset/stderrOffset: byte offsets for incremental reads.
@@ -837,6 +885,7 @@ Parameters:
       workdir: z.string()
         .optional()
         .describe("Working directory inside WSL for action=start."),
+      distro: distroField,
       max_runtime_ms: z.number()
         .int()
         .positive()
@@ -878,6 +927,7 @@ Parameters:
     command?: string;
     jobId?: string;
     workdir?: string;
+    distro?: string;
     max_runtime_ms?: number;
     wait_ms?: number;
     stdoutOffset?: number;

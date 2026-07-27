@@ -129,7 +129,17 @@ __wsl_mcp_block_mnt_delete_path() {
 
   __wsl_mcp_resolved="$(__wsl_mcp_realpath "$1")"
   if __wsl_mcp_is_mnt_path "$1" || __wsl_mcp_is_mnt_path "$__wsl_mcp_resolved"; then
+    __wsl_mcp_win_hint="$__wsl_mcp_resolved"
+    case "$__wsl_mcp_resolved" in
+      /mnt/[a-zA-Z]/*|/mnt/[a-zA-Z])
+        __wsl_mcp_drive="$(printf '%s' "$__wsl_mcp_resolved" | cut -c6 | tr '[:lower:]' '[:upper:]')"
+        __wsl_mcp_rest="$(printf '%s' "$__wsl_mcp_resolved" | cut -c7- | tr '/' '\\\\')"
+${"        __wsl_mcp_win_hint=\"${__wsl_mcp_drive}:${__wsl_mcp_rest}\""}
+        ;;
+    esac
     printf 'WSL MCP blocked deletion under /mnt: %s (resolved: %s)\n' "$1" "$__wsl_mcp_resolved" >&2
+    printf 'Do NOT delete Windows-mounted paths via WSL. Delete on the Windows host instead (PowerShell Remove-Item -LiteralPath, or the host file tools).\n' >&2
+    printf 'Suggested Windows path: %s\n' "$__wsl_mcp_win_hint" >&2
     return 64
   fi
   return 0
@@ -316,11 +326,22 @@ export async function stopSession() {
 export function stopSessionSync() {
     return stopSessionUnlocked();
 }
+function resolveRunDistro(options = {}) {
+    return typeof options.distro === "undefined" ? currentDistro : options.distro;
+}
 async function spawnWslCommandRaw(cmdArgs, input, options = {}) {
     return new Promise((resolve, reject) => {
         withSessionLock(async () => {
-            await startSessionUnlocked();
-            const args = wslArgsFor(currentDistro, cmdArgs);
+            const runDistro = resolveRunDistro(options);
+            // Only warm keepalive for the process default distro. One-shot overrides
+            // run without mutating the session so concurrent multi-distro calls stay safe.
+            if (typeof options.distro === "undefined") {
+                await startSessionUnlocked();
+            }
+            else {
+                await probeWsl(runDistro);
+            }
+            const args = wslArgsFor(runDistro, cmdArgs);
             const proc = spawn(WSL_EXE, args, windowsHiddenSpawnOptions());
             const timeout = boundedDuration(options.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS);
             const stdout = [];
@@ -386,11 +407,16 @@ export async function runWslRawScript(script, options = {}) {
     const input = buildScriptInput(script.endsWith("\n") ? script : `${script}\n`);
     return spawnWslCommandRaw(["sh", "-s"], input, options);
 }
-async function startWslTask(command, shell, workdir) {
+async function startWslTask(command, shell, workdir, distro) {
     let createdTask = null;
     await withSessionLock(async () => {
-        await startSessionUnlocked();
-        const configuredDistro = currentDistro;
+        const configuredDistro = typeof distro === "undefined" ? currentDistro : distro;
+        if (typeof distro === "undefined") {
+            await startSessionUnlocked();
+        }
+        else {
+            await probeWsl(configuredDistro);
+        }
         const proc = spawn(WSL_EXE, wslArgsFor(configuredDistro, [shell, "-l", "-s"]), windowsHiddenSpawnOptions());
         const input = buildScriptInput(command.endsWith("\n") ? command : `${command}\n`, workdir);
         createdTask = taskManager.start(proc, {
@@ -405,11 +431,11 @@ async function startWslTask(command, shell, workdir) {
     }
     return createdTask;
 }
-export async function execWslAsync(command, workdir) {
-    return startWslTask(command, "bash", workdir);
+export async function execWslAsync(command, workdir, options = {}) {
+    return startWslTask(command, "bash", workdir, options.distro);
 }
-export async function execWslScriptAsync(script, shell = "bash", workdir) {
-    return startWslTask(script, shell, workdir);
+export async function execWslScriptAsync(script, shell = "bash", workdir, options = {}) {
+    return startWslTask(script, shell, workdir, options.distro);
 }
 export function listTasks() {
     return taskManager.list();
@@ -440,8 +466,8 @@ export async function waitTask(taskId, waitMs = DEFAULT_TASK_WAIT_MS, options = 
         maxWaitMs: wait.maxMs,
     };
 }
-export async function watchWslTask(command, shell, workdir, timeoutMs = DEFAULT_WATCH_TIMEOUT_MS, timeoutBehavior = "detach", outputOptions = {}) {
-    const task = await startWslTask(command, shell, workdir);
+export async function watchWslTask(command, shell, workdir, timeoutMs = DEFAULT_WATCH_TIMEOUT_MS, timeoutBehavior = "detach", outputOptions = {}, distro) {
+    const task = await startWslTask(command, shell, workdir, distro);
     const timeout = boundedDuration(timeoutMs, DEFAULT_WATCH_TIMEOUT_MS);
     const waitResult = await waitTask(task.taskId, timeout.ms, outputOptions);
     let killed = false;
@@ -637,8 +663,13 @@ export async function startPersistentJob(options) {
     const commandB64 = Buffer.from(options.command, "utf8").toString("base64");
     const workdirB64 = options.workdir ? Buffer.from(options.workdir, "utf8").toString("base64") : "";
     const runnerScript = buildPersistentJobRunnerScript({ jobId, commandB64, workdirB64, maxRuntimeMs });
-    await ensureSessionStarted();
-    const configuredDistro = currentDistro;
+    const configuredDistro = typeof options.distro === "undefined" ? currentDistro : options.distro;
+    if (typeof options.distro === "undefined") {
+        await ensureSessionStarted();
+    }
+    else {
+        await probeWsl(configuredDistro);
+    }
     const startResult = await execWslScriptForDistro(runnerScript, configuredDistro);
     if (startResult.exitCode !== 0) {
         throw new Error(`Failed to start persistent job ${jobId}: ${startResult.stderr.trim() || `wsl.exe exited with code ${startResult.exitCode}`}`);
