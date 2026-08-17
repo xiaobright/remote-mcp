@@ -399,7 +399,8 @@ server.registerTool("wsl_task", {
     title: "Manage WSL Async Task",
     description: `Manage async/watch WSL tasks started by wsl_exec/wsl_script with mode="async"/"watch" (on_timeout="detach").
 Actions: status, output, wait, cancel, list. taskId required for status/output/wait/cancel; wait uses wait_ms; output uses stdoutOffset/stderrOffset/tail_chars/read_mode.
-Use action="wait" for builds/tests. status/output are throttled server-side: querying too soon blocks to the minimum poll interval.`,
+Use action="wait" for builds/tests. status/output are throttled server-side: querying too soon blocks to the minimum poll interval.
+task dies when this MCP process exits; use wsl_job for work that must survive MCP restart.`,
     inputSchema: z.object({
         action: z.enum(["status", "output", "wait", "cancel", "list"]),
         taskId: z.string()

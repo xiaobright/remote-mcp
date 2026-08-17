@@ -682,7 +682,18 @@ old_string must match exactly once unless replace_all=true (errors instead of gu
     {
       title: `${options.titlePrefix} Apply Patch`,
       description: `Apply a Codex-style patch to remote files (Add File / Update File; Delete/Move unsupported). ${options.targetDescription}
-Multi-file edits; focused single-file replacements should use ${options.prefix}_edit. Patch format details: read the remote-execution skill.`,
+Multi-file edits; focused single-file replacements should use ${options.prefix}_edit.
+Format:
+*** Begin Patch
+*** Update File: <path>
+@@
+  context line (leading space)
+-removed line
++added line
+*** Add File: <path>
++new file content line
+*** End Patch
+Update hunk lines need a marker each: space=context, +=added, -=removed.`,
       inputSchema: z.object({
         ...common,
         patch: z.string().min(1).describe("Patch text using the Codex-style *** Begin Patch format."),
@@ -861,7 +872,7 @@ action selects the operation:
   read(path, max_bytes?, encoding?) - read text file (text in structuredContent.text)
   write(path, content, create_parents?, overwrite?, expected_sha256?, mode?, encoding?) - write text file
   edit(path, old_string, new_string, replace_all?, dry_run?, expected_sha256?, max_bytes?, encoding?) - replace exact text once
-  apply_patch(patch, dry_run?, max_bytes?, encoding?) - Codex-style patch (Add/Update File)
+  apply_patch(patch, dry_run?, max_bytes?, encoding?) - Codex-style patch (Add/Update File; format: *** Begin Patch / *** Update File: <path> / @@ / space=context, -=removed, +=added / *** Add File: <path> / *** End Patch)
   list(path) - list directory
   stat(path) - inspect path
   search(path, pattern, fixed?, max_results?, encoding?) - grep search
