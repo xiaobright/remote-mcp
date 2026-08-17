@@ -659,23 +659,11 @@ function unifiedSchema(options) {
         max_results: z.number().int().positive().optional().describe("Max result lines (search)."),
         max_bytes: z.number().int().positive().optional().describe("Maximum file size to read."),
         encoding: encodingField,
-    }).strict().superRefine((val, ctx) => {
-        const required = {
-            read: ["path"],
-            write: ["path", "content"],
-            edit: ["path", "old_string", "new_string"],
-            apply_patch: ["patch"],
-            list: ["path"],
-            stat: ["path"],
-            search: ["path", "pattern"],
-        };
-        const record = val;
-        for (const field of required[record.action] ?? []) {
-            if (record[field] === undefined) {
-                ctx.addIssue({ code: z.ZodIssueCode.custom, message: `action=${record.action} requires "${field}"`, path: [field] });
-            }
-        }
-    });
+        // Keep this as a plain ZodObject. The MCP SDK serializes ZodEffects
+        // (created by superRefine) as an empty JSON schema, hiding action/path/patch
+        // from the model. Action-specific required fields are enforced by the
+        // handlers via requireStringParam/rejectUnexpectedParams.
+    }).strict();
 }
 export function registerUnifiedRemoteFileTools(options) {
     const toolName = options.prefix; // e.g. ssh_file / wsl_file
