@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { errorResponse } from "@remote-mcp/shared/mcp";
-import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
+import { registerRemoteFileTools, registerUnifiedRemoteFileTools, } from "@remote-mcp/shared/remote";
 import { cancelAllTasksSync, cancelTask, candidateTargetsFor, getDevice, getSshState, listDevices, listTasks, observeTaskOutput, observeTaskStatus, removeDevice, runSshRawScript, runSshScript, setDefaultTarget, startSshTask, testSshTarget, upsertDevice, waitTask, watchSshTask, startPersistentJob, getPersistentJobStatus, readPersistentJobOutput, waitPersistentJob, cancelPersistentJob, listPersistentJobs, } from "./ssh.js";
 const server = new McpServer({
     name: "ssh-mcp-server",
@@ -11,7 +11,7 @@ const server = new McpServer({
 });
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
-registerRemoteFileTools({
+const fileToolOptions = {
     server,
     prefix: "ssh_file",
     titlePrefix: "SSH",
@@ -39,7 +39,14 @@ registerRemoteFileTools({
             : undefined,
         timeoutMs: typeof params.timeout_ms === "number" ? params.timeout_ms : undefined,
     }),
-});
+};
+// REMOTE_MCP_FILE_API=unified 时把 7 个 ssh_file_* 合并为 1 个 ssh_file（action 区分）
+if (process.env.REMOTE_MCP_FILE_API === "unified") {
+    registerUnifiedRemoteFileTools(fileToolOptions);
+}
+else {
+    registerRemoteFileTools(fileToolOptions);
+}
 function formatCommandResult(result) {
     return [
         result.target ? `Target: ${result.target}\n` : "",
@@ -370,32 +377,10 @@ async function runScriptTool(params) {
 // validation runs. Do not override CallToolRequestSchema on server.server.
 server.registerTool("ssh_profile", {
     title: "Manage SSH Target",
-    description: `Unified process-local SSH target/profile helper and lightweight device registry.
-
-This SSH MCP intentionally does not keep a long-lived remote shell. Each run
-starts a fresh local ssh process. That keeps remote state clean and avoids
-hanging sessions. Use OpenSSH ControlMaster in ssh_options or ~/.ssh/config if
-you later need connection reuse.
-
-Device profiles are non-secret connection records. They can store a friendly
-name, user, one or more candidate hosts/IPs, port, identityFile, ssh_options,
-tags, and defaultWorkdir. They must not store passwords. When a target matches a
-device name, ssh_exec/ssh_script try the remembered last target first, then the
-saved target/host/hosts until one connects. Successful connections update
-lastResolvedTarget and lastSeen.
-
-Actions:
-  - status: show default target, ssh command, default options, task count.
-  - list_devices: list saved device profiles and candidate targets.
-  - get_device: show one saved profile by name.
-  - upsert_device: create/update a profile.
-  - remove_device: delete a saved profile.
-  - set_default: set this MCP process's default target, e.g. devbox or user@example.com.
-  - clear_default: clear default target.
-  - test: run a small read-only probe on the target/device, trying saved hosts in order.
-
-This is the SSH counterpart to wsl_session. Use ssh_profile only for target
-state; use ssh_exec/ssh_script for execution and ssh_task for async/watch tasks.`,
+    description: `Manage SSH target/profile state and a lightweight non-secret device registry.
+Each run starts a fresh ssh process (no persistent session; use OpenSSH ControlMaster if you need reuse).
+Actions: status, set_default, clear_default, test, list_devices, get_device, upsert_device, remove_device.
+Parameter and workflow details: read the remote-execution skill.`,
     inputSchema: z.object({
         action: z.enum(["status", "set_default", "clear_default", "test", "list_devices", "get_device", "upsert_device", "remove_device"]),
         name: z.string()
@@ -455,29 +440,9 @@ state; use ssh_exec/ssh_script for execution and ssh_task for async/watch tasks.
 });
 server.registerTool("ssh_task", {
     title: "Manage SSH Async Task",
-    description: `Unified async/watch SSH task manager for tasks started by ssh_exec/ssh_script
-with mode="async" or mode="watch" and on_timeout="detach".
-
-Actions:
-  - status: get state and output lengths.
-  - output: read stdout/stderr with offsets or tail_chars.
-  - wait: block inside this MCP server for wait_ms, returning early if the task exits.
-  - cancel: kill the owned local ssh child process.
-  - list: list process-local tasks.
-
-Parameter names intentionally match wsl_task:
-  - taskId is required for status/output/wait/cancel.
-  - wait uses wait_ms.
-  - output offsets use stdoutOffset/stderrOffset.
-  - read_mode defaults to a bounded delta window; use "full" with offsets to page retained output.
-  - task output tailing uses tail_chars.
-
-Prefer synchronous ssh_exec/ssh_script for normal commands and long builds/tests
-when there is no other foreground work to do. Use mode="async" only when real
-background concurrency is needed. Use action="wait" for builds/tests. status/output
-are throttled by the MCP server: if queried too soon for a running task, the tool
-blocks until the minimum poll interval is reached, then returns a warning plus the
-real result.`,
+    description: `Manage async/watch SSH tasks started by ssh_exec/ssh_script with mode="async"/"watch" (on_timeout="detach").
+Actions: status, output, wait, cancel, list. taskId required for status/output/wait/cancel; wait uses wait_ms; output uses stdoutOffset/stderrOffset/tail_chars/read_mode.
+Use action="wait" for builds/tests. status/output are throttled server-side: querying too soon blocks to the minimum poll interval.`,
     inputSchema: z.object({
         action: z.enum(["status", "output", "wait", "cancel", "list"]),
         taskId: z.string()
@@ -528,57 +493,8 @@ real result.`,
 });
 server.registerTool("ssh_exec", {
     title: "Run SSH Command",
-    description: `Execute a shell command on a remote SSH target.
-
-The command is sent to the remote shell through stdin, not embedded into a
-PowerShell/cmd ssh command line. This avoids local Windows escaping problems
-with pipes, redirection, here-docs, $(), $VAR, and nested quotes.
-
-Each call starts a fresh local ssh process. For complex commands, prefer
-ssh_script so the model can write a clear multi-line script.
-
-Args:
-  - command (string, required): The shell command to execute.
-    Example: "ls -la /home"
-  - target (string, optional): SSH target or saved device name. Omit to use
-    SSH_MCP_DEFAULT_TARGET or ssh_profile set_default.
-  - shell (string, optional): Remote shell to run. Default: "bash".
-  - login (boolean, optional): Use login shell mode for bash/zsh. Default: true.
-  - workdir (string, optional): Remote working directory.
-  - env (object, optional): Environment variables exported before running.
-  - ssh_options (string[], optional): Extra ssh argv items.
-  - mode: "sync" (default), "async", or "watch".
-    sync waits for completion and kills the local ssh process if timeout_ms is reached.
-    async returns a taskId immediately.
-    watch waits up to timeout_ms, then either detaches or kills depending on on_timeout.
-  - timeout_ms: sync/watch timeout in milliseconds. Long requested timeouts may be capped
-    internally so the MCP client can still receive a timeout result.
-  - on_timeout: for watch only, "detach" (default) or "kill".
-  - read_mode: for watch output, "delta" (default) keeps a bounded window; "full" pages from the requested offset.
-  - tail_chars: for watch output, return only the tail of each stream.
-
-Parameter names intentionally match wsl_exec/wsl_script. Prefer sync mode for
-ordinary commands and long builds/tests when there is no other work to do. Start
-background work by passing mode="async" here only when necessary. For complex
-commands, use ssh_script instead of local PowerShell/cmd ssh command-line
-composition.
-
-Returns:
-  sync: { target, stdout, stderr, exitCode, timedOut?, timeoutMs? }
-  async: task snapshot
-  watch: task output snapshot plus detached/killed/timedOut fields
-
-Examples:
-  - command="ls -la /home"                            -> list remote home directory
-  - command="uname -a"                                -> short remote command
-  - target="devbox" + command="uptime"                -> saved device profile
-  - target="user@example.com" + command="uptime"      -> explicit target
-  - workdir="/home/alice/project" + command="npm test"
-  - mode="watch", timeout_ms=120000 for builds that may take a while
-
-Error Handling:
-  - Returns stdout/stderr and non-zero exitCode on failure
-  - Returns SSH connection/auth/host-key errors in stderr or as Error text`,
+    description: `Execute a shell command on a remote SSH target. Command is sent via stdin to the remote shell, avoiding Windows quoting issues (pipes, $(), heredocs, nested quotes).
+Each call starts a fresh ssh process. Prefer sync for ordinary commands and long builds/tests; mode="async"/"watch" + ssh_task for background work. For complex multi-line commands use ssh_script.`,
     inputSchema: z.object({
         command: z.string()
             .min(1, "command is required")
@@ -640,48 +556,8 @@ Error Handling:
 });
 server.registerTool("ssh_script", {
     title: "Run SSH Script",
-    description: `Execute a multi-line shell script on a remote SSH target.
-
-The script is passed via ssh stdin to the remote shell. This is the main tool
-for avoiding local quoting and escaping traps when running remote Linux
-commands from Windows.
-
-This tool does not create or reuse a persistent SSH session. It starts one local
-ssh child process per call, which is usually fast enough on LAN and keeps remote
-state predictable.
-
-Args:
-  - script (string, required): Script content to execute. Can be multiple lines.
-    Example: "echo hello\\necho world"
-  - target (string, optional): SSH target or saved device name. Omit to use
-    SSH_MCP_DEFAULT_TARGET or ssh_profile set_default.
-  - shell (string, optional): Remote shell to run. Default: "bash".
-  - login (boolean, optional): Use login shell mode for bash/zsh. Default: true.
-  - workdir (string, optional): Remote working directory.
-  - env (object, optional): Environment variables exported before running.
-  - ssh_options (string[], optional): Extra ssh argv items.
-  - mode: "sync" (default), "async", or "watch".
-  - timeout_ms: sync/watch timeout in milliseconds. Long requested timeouts may be capped
-    internally so the MCP client can still receive a timeout result.
-  - on_timeout: for watch only, "detach" (default) or "kill".
-  - read_mode: for watch output, "delta" (default) keeps a bounded window; "full" pages from the requested offset.
-  - tail_chars: for watch output, return only the tail of each stream.
-
-Parameter names intentionally match wsl_exec/wsl_script. Prefer sync mode for
-ordinary commands and long builds/tests when there is no other work to do. Start
-background work by passing mode="async" here only when necessary.
-
-Returns:
-  Same as ssh_exec: sync command result, async task snapshot, or watch output.
-
-Examples:
-  - script="git status\\ngit log --oneline -3"        -> run multiple commands
-  - script="for f in *.txt; do echo $f; done"         -> shell loop
-  - shell="zsh" + script="echo $ZSH_VERSION"          -> use specific shell
-  - mode="watch", timeout_ms=120000 for builds that may take a while
-
-Error Handling:
-  - Same as ssh_exec`,
+    description: `Execute a multi-line shell script on a remote SSH target. Script is passed via stdin to the remote shell; prefer this over ssh_exec for pipes, $(), loops, heredocs, and quoting.
+No persistent session: one ssh child process per call. Prefer sync for ordinary work; mode="async"/"watch" + ssh_task for background. Parameter names match wsl_script.`,
     inputSchema: z.object({
         script: z.string()
             .min(1, "script is required")
@@ -740,36 +616,8 @@ Error Handling:
 });
 server.registerTool("ssh_job", {
     title: "Manage SSH Persistent Job",
-    description: `Detached persistent job manager for SSH. Unlike ssh_task (attached, dies with MCP),
-persistent jobs run fully detached inside the remote SSH host via setsid. Logs
-and pid files live in ~/.remote-mcp/jobs/<jobId>/ on the remote host; metadata
-is stored on the Windows side. Any agent with the jobId can re-attach, read
-logs, or cancel — even after MCP or Codex restarts.
-
-Actions:
-  - start: launch a detached command on the remote host. Returns jobId immediately.
-  - status: check job state (running/exited/cancelled/expired).
-  - output: read stdout/stderr logs with offsets or tail_chars.
-  - wait: poll until the job exits or wait_ms elapses, then return output.
-  - cancel: send SIGTERM to the job's process group on the remote host.
-  - list: list all known persistent jobs.
-
-Use ssh_job for long-running tasks like remote firmware builds that may outlive
-the MCP process. Default read_mode is "delta" (bounded tail window) to prevent
-context explosion; use read_mode="full" with stdoutOffset/stderrOffset to page
-through complete logs without a single huge response.
-
-Parameters:
-  - action (required): start | status | output | wait | cancel | list
-  - command (required for start): shell command to execute detached on the remote host.
-  - jobId (required for status/output/wait/cancel): UUID returned by start.
-  - target (optional, for start): SSH target or device name. Omit to use default.
-  - workdir (optional, for start): remote working directory.
-  - max_runtime_ms (optional, for start): auto-expire deadline. Default 1h.
-  - wait_ms (optional, for wait): max poll duration. Default 30000.
-  - stdoutOffset/stderrOffset: byte offsets for incremental reads.
-  - tail_chars: read only the last N characters from each stream.
-  - read_mode: "delta" (default) or "full".`,
+    description: `Manage detached persistent SSH jobs that survive MCP restart: runs detached on the remote host (setsid), logs in ~/.remote-mcp/jobs/<jobId>/ on the remote host.
+Actions: start, status, output, wait, cancel, list. read_mode default "delta" (bounded tail); use "full" with offsets to page logs. Workflow details: read the remote-execution skill.`,
     inputSchema: z.object({
         action: z.enum(["start", "status", "output", "wait", "cancel", "list"]),
         command: z.string()

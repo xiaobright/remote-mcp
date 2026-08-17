@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { errorResponse } from "@remote-mcp/shared/mcp";
-import { registerRemoteFileTools } from "@remote-mcp/shared/remote";
+import { registerRemoteFileTools, registerUnifiedRemoteFileTools, type RegisterRemoteFileToolsOptions } from "@remote-mcp/shared/remote";
 import {
   execWsl,
   execWslAsync,
@@ -53,7 +53,7 @@ const distroField = z.string()
   .optional()
   .describe('Optional one-shot distro override (e.g. "Ubuntu-22.04"). Does not change the process session default. Pass "default" for system default.');
 
-registerRemoteFileTools({
+const fileToolOptions: RegisterRemoteFileToolsOptions = {
   server,
   prefix: "wsl_file",
   titlePrefix: "WSL",
@@ -75,7 +75,14 @@ registerRemoteFileTools({
       distro,
     });
   },
-});
+};
+
+// REMOTE_MCP_FILE_API=unified 时把 7 个 wsl_file_* 合并为 1 个 wsl_file（action 区分）
+if (process.env.REMOTE_MCP_FILE_API === "unified") {
+  registerUnifiedRemoteFileTools(fileToolOptions);
+} else {
+  registerRemoteFileTools(fileToolOptions);
+}
 
 function formatCommandResult(result: {
   stdout: string;
@@ -515,17 +522,9 @@ server.registerTool(
   "wsl_session",
   {
     title: "Manage WSL Session",
-    description: `Unified process-local WSL session manager.
-
-Actions:
-  - status: read this MCP process's keepalive/configured distro state.
-  - start: start or warm the process-local keepalive.
-  - stop: stop only this MCP process's keepalive; does not terminate the WSL distro globally.
-  - set_distro: set this MCP process's configured distro; stops this process's keepalive if needed.
-  - list_distros: list installed WSL distributions.
-
-Use only this public session tool for WSL session state. Session state is owned
-by this MCP process.`,
+    description: `Manage this MCP process's WSL session state (keepalive + configured distro).
+Actions: status, start, stop, set_distro, list_distros. Session state is owned by this MCP process.
+Workflow details: read the remote-execution skill.`,
     inputSchema: z.object({
       action: z.enum(["status", "start", "stop", "set_distro", "list_distros"]),
       distro: z.string()
@@ -552,25 +551,9 @@ server.registerTool(
   "wsl_task",
   {
     title: "Manage WSL Async Task",
-    description: `Unified async/watch WSL task manager for tasks started by wsl_exec/wsl_script
-with mode="async" or mode="watch" and on_timeout="detach".
-
-Actions:
-  - status: get state and output lengths.
-  - output: read stdout/stderr with offsets or tail_chars.
-  - wait: block inside this MCP server for wait_ms, returning early if the task exits.
-  - cancel: kill the owned wsl.exe child process.
-  - list: list process-local tasks.
-
-Parameter names intentionally match ssh_task:
-  - taskId is required for status/output/wait/cancel.
-  - wait uses wait_ms.
-  - output offsets use stdoutOffset/stderrOffset.
-  - task output tailing uses tail_chars.
-
-Use action="wait" for builds/tests. status/output are throttled by the MCP
-server: if queried too soon for a running task, the tool blocks until the minimum
-poll interval is reached, then returns a warning plus the real result.`,
+    description: `Manage async/watch WSL tasks started by wsl_exec/wsl_script with mode="async"/"watch" (on_timeout="detach").
+Actions: status, output, wait, cancel, list. taskId required for status/output/wait/cancel; wait uses wait_ms; output uses stdoutOffset/stderrOffset/tail_chars/read_mode.
+Use action="wait" for builds/tests. status/output are throttled server-side: querying too soon blocks to the minimum poll interval.`,
     inputSchema: z.object({
       action: z.enum(["status", "output", "wait", "cancel", "list"]),
       taskId: z.string()
@@ -633,57 +616,9 @@ server.registerTool(
   "wsl_exec",
   {
     title: "Run WSL Command",
-    description: `Execute a shell command inside this MCP process's WSL session.
-
-This tool is intended to avoid the quoting and escaping traps that happen when
-running Linux commands through wsl.exe from PowerShell, especially for pipes,
-redirection, here-docs, $() and $VAR expansion, and nested quotes. Prefer it over
-hand-written wsl.exe invocations when a WSL MCP tool is available.
-By default it also blocks common delete operations whose target or resolved path
-is under /mnt, while still allowing normal reads and writes there.
-
-Each call still uses a fresh shell, but the keepalive process keeps the chosen
-WSL distro warm. If the session is not running, it is auto-started on demand.
-Concurrent command calls spawn separate WSL shells.
-
-Args:
-  - command (string, required): The shell command to execute.
-    Example: "ls -la /home"
-  - workdir (string, optional): Working directory inside WSL.
-    Example: "/home/user/project"
-  - mode: "sync" (default), "async", or "watch".
-    sync waits for completion and kills the WSL child if timeout_ms is reached.
-    async returns a taskId immediately.
-    watch waits up to timeout_ms, then either detaches or kills depending on on_timeout.
-  - timeout_ms: sync/watch timeout in milliseconds. Long requested timeouts may be capped
-    internally so the MCP client can still receive a timeout result.
-  - on_timeout: for watch only, "detach" (default) or "kill".
-  - tail_chars: for watch output, return only the tail of each stream.
-  - distro: optional one-shot distro override; does not change session default.
-
-Parameter names intentionally match ssh_exec/ssh_script. Start background work by
-passing mode="async" here.
-
-Deletes under /mnt are blocked on purpose: delete Windows paths on the host
-(PowerShell Remove-Item), not through WSL.
-
-Returns:
-  sync: { stdout, stderr, exitCode, timedOut?, timeoutMs? }
-  async: task snapshot
-  watch: task output snapshot plus detached/killed/timedOut fields
-
-Examples:
-  - "ls -la /home"                                   -> list home directory
-  - "cd /tmp && curl -s ifconfig.me"                  -> chain commands
-  - "node -e 'console.log(2+2)'"                      -> inline script
-  - workdir="/home/user/project" + "npm test"         -> run in project dir
-  - distro="Ubuntu-22.04" + "uname -a"                -> one-shot other distro
-  - mode="watch", timeout_ms=120000 for builds that may take a while
-
-Error Handling:
-  - Returns stdout/stderr and non-zero exitCode on failure
-  - Returns "Error: ENOENT" if wsl.exe is not found on PATH
-  - Returns startup/probe errors if the configured distro cannot be launched`,
+    description: `Execute a shell command inside this MCP process's WSL session. Avoids wsl.exe quoting traps for pipes, redirection, $(), and nested quotes.
+Each call uses a fresh shell; keepalive keeps the distro warm (auto-start on demand). Deletes under /mnt are blocked on purpose: delete Windows paths on the host, not through WSL.
+Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. Complex multi-line commands: use wsl_script.`,
     inputSchema: z.object({
       command: z.string()
         .min(1, "command is required")
@@ -741,48 +676,9 @@ server.registerTool(
   "wsl_script",
   {
     title: "Run WSL Script",
-    description: `Execute a multi-line shell script inside this MCP process's WSL session.
-
-Unlike wsl_exec, this tool passes the script via stdin (\`bash -l -s\`), so
-quoting and special characters inside the script are never interpreted by Windows.
-It is intended to avoid PowerShell-to-wsl.exe escaping traps for complex Linux
-scripts with pipes, redirection, here-docs, $()/$VAR expansion, and nested quotes.
-Prefer it over hand-written wsl.exe bash -lc strings when a WSL MCP tool is available.
-By default it also blocks common delete operations whose target or resolved path
-is under /mnt, while still allowing normal reads and writes there.
-If the session is not running, it is auto-started on demand. Concurrent script
-calls spawn separate WSL shells.
-
-Args:
-  - script (string, required): Script content to execute. Can be multiple lines.
-    Example: "echo hello\\necho world"
-  - shell (string, optional): Shell to use (default: "bash").
-    Options: "bash", "sh", "zsh", "dash", etc.
-  - workdir (string, optional): Working directory inside WSL.
-  - mode: "sync" (default), "async", or "watch".
-  - timeout_ms: sync/watch timeout in milliseconds. Long requested timeouts may be capped
-    internally so the MCP client can still receive a timeout result.
-  - on_timeout: for watch only, "detach" (default) or "kill".
-  - tail_chars: for watch output, return only the tail of each stream.
-  - distro: optional one-shot distro override; does not change session default.
-
-Parameter names intentionally match ssh_exec/ssh_script. Start background work by
-passing mode="async" here.
-
-Deletes under /mnt are blocked on purpose: delete Windows paths on the host.
-
-Returns:
-  Same as wsl_exec: sync command result, async task snapshot, or watch output.
-
-Examples:
-  - script="git status\\ngit log --oneline -3"        -> run multiple commands
-  - script="for f in *.txt; do echo \$f; done"        -> shell loop
-  - shell="zsh" + script="echo \$ZSH_VERSION"         -> use specific shell
-  - distro="Ubuntu-22.04" + script="df -h /"          -> one-shot other distro
-  - mode="watch", timeout_ms=120000 for builds that may take a while
-
-Error Handling:
-  - Same as wsl_exec`,
+    description: `Execute a multi-line shell script inside this MCP process's WSL session. Script passes via stdin (bash -l -s), so quoting/heredocs are never interpreted by Windows.
+Deletes under /mnt are blocked on purpose: delete Windows paths on the host, not through WSL.
+Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. Parameter names match wsl_exec.`,
     inputSchema: z.object({
       script: z.string()
         .min(1, "script is required")
@@ -844,36 +740,8 @@ server.registerTool(
   "wsl_job",
   {
     title: "Manage WSL Persistent Job",
-    description: `Detached persistent job manager for WSL. Unlike wsl_task (attached, dies with MCP),
-persistent jobs run fully detached inside WSL via setsid. Logs and pid files
-live in ~/.remote-mcp/jobs/<jobId>/; metadata is stored on the Windows side.
-Any agent with the jobId can re-attach, read logs, or cancel — even after MCP
-or Codex restarts.
-
-Actions:
-  - start: launch a detached command. Returns jobId immediately.
-  - status: check job state (running/exited/cancelled/expired).
-  - output: read stdout/stderr logs with offsets or tail_chars.
-  - wait: poll until the job exits or wait_ms elapses, then return output.
-  - cancel: send SIGTERM to the job's process group.
-  - list: list all known persistent jobs.
-
-Use wsl_job for long-running tasks like firmware builds that may outlive the
-MCP process. Default read_mode is "delta" (bounded tail window) to prevent
-context explosion; use read_mode="full" with stdoutOffset/stderrOffset to page
-through complete logs without a single huge response.
-
-Parameters:
-  - action (required): start | status | output | wait | cancel | list
-  - command (required for start): shell command to execute detached.
-  - jobId (required for status/output/wait/cancel): UUID returned by start.
-  - workdir (optional, for start): working directory inside WSL.
-  - distro (optional, for start): one-shot distro override for the job.
-  - max_runtime_ms (optional, for start): auto-expire deadline. Default 1h.
-  - wait_ms (optional, for wait): max poll duration. Default 30000.
-  - stdoutOffset/stderrOffset: byte offsets for incremental reads.
-  - tail_chars: read only the last N characters from each stream.
-  - read_mode: "delta" (default) or "full".`,
+    description: `Manage detached persistent WSL jobs that survive MCP restart: runs fully detached inside WSL (setsid), logs in ~/.remote-mcp/jobs/<jobId>/.
+Actions: start, status, output, wait, cancel, list. read_mode default "delta" (bounded tail); use "full" with offsets to page logs. Workflow details: read the remote-execution skill.`,
     inputSchema: z.object({
       action: z.enum(["start", "status", "output", "wait", "cancel", "list"]),
       command: z.string()

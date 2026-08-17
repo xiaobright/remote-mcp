@@ -13,5 +13,6 @@ export interface RegisterRemoteFileToolsOptions {
     makeRunner: (params: Record<string, unknown>) => RemoteScriptRunner;
 }
 export declare function registerRemoteFileTools(options: RegisterRemoteFileToolsOptions): Record<string, RemoteFileToolHandler>;
+export declare function registerUnifiedRemoteFileTools(options: RegisterRemoteFileToolsOptions): Record<string, RemoteFileToolHandler>;
 export {};
 //# sourceMappingURL=fileTools.d.ts.map

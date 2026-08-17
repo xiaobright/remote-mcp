@@ -51,7 +51,7 @@ const pathField = z.string()
 
 const encodingField = z.string()
   .optional()
-  .describe('Text encoding for file content. Defaults to "auto"; explicit values include "utf-8", "gbk", and "gb18030".');
+  .describe('Text encoding, default "auto" (utf-8/gbk/gb18030).');
 
 function resolvePath(root: unknown, path: string): string {
   const resolved = joinRemotePath(typeof root === "string" ? root : undefined, path);
@@ -229,28 +229,347 @@ function commonFields(options: RegisterRemoteFileToolsOptions): ZodRawShape {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Action handlers (shared by legacy per-tool registration and unified tool)
+// ---------------------------------------------------------------------------
+
+async function handleRead(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_read`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path", "max_bytes", "encoding"], toolName, );
+  const runner = options.makeRunner(params);
+  const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
+  const decoded = await readTextFileDecoded(runner, path, {
+    maxBytes: maxBytes(params),
+    encoding: requestedEncoding(params),
+  });
+  return {
+    content: [{ type: "text" as const, text: formatReadSummary(path, decoded) }],
+    structuredContent: {
+      path,
+      text: decoded.text,
+      bytes: decoded.bytes,
+      sha256: decoded.sha256,
+      encoding: decoded.encoding,
+      requestedEncoding: decoded.requestedEncoding,
+      detectedEncoding: decoded.detectedEncoding,
+      encodingConfidence: decoded.confidence,
+      encodingWarning: decoded.warning,
+    },
+  };
+}
+
+async function handleWrite(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_write`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path", "content", "create_parents", "overwrite", "expected_sha256", "mode", "encoding"], toolName, );
+  const runner = options.makeRunner(params);
+  const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
+  const overwrite = typeof params.overwrite === "boolean" ? params.overwrite : true;
+  const writeEncoding = await resolveWriteEncoding(runner, path, params, overwrite);
+  const result = await writeTextFile(runner, {
+    path,
+    content: requireStringParam(params, "content", toolName, { allowEmpty: true }),
+    createParents: typeof params.create_parents === "boolean" ? params.create_parents : true,
+    overwrite,
+    expectedSha256: typeof params.expected_sha256 === "string" ? params.expected_sha256 : undefined,
+    mode: typeof params.mode === "string" ? params.mode : undefined,
+    encoding: writeEncoding,
+  });
+  return {
+    content: [{ type: "text" as const, text: `Wrote ${result.bytes} bytes to ${path}\nsha256: ${result.sha256}` }],
+    structuredContent: {
+      path,
+      ...result,
+      encoding: writeEncoding,
+      requestedEncoding: requestedEncoding(params),
+    },
+  };
+}
+
+async function handleEdit(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_edit`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path", "old_string", "new_string", "replace_all", "oldString", "newString", "replaceAll", "dry_run", "expected_sha256", "max_bytes", "encoding"], toolName, );
+  const runner = options.makeRunner(params);
+  const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
+  const textEncoding = requestedEncoding(params);
+  const original = await readTextFileDecoded(runner, path, {
+    maxBytes: maxBytes(params),
+    encoding: textEncoding,
+  });
+
+  const expectedSha = typeof params.expected_sha256 === "string" ? params.expected_sha256 : undefined;
+  if (expectedSha && expectedSha !== original.sha256) {
+    return shaMismatchResponse(path, expectedSha, original);
+  }
+
+  const oldString = stringParamWithAlias(params, "old_string", "oldString", toolName);
+  const newString = stringParamWithAlias(params, "new_string", "newString", toolName, { allowEmpty: true });
+  const replaceAll = booleanParamWithAlias(params, "replace_all", "replaceAll", false, toolName);
+  const applied = applyTextEdit(original.text, oldString, newString, {
+    replaceAll,
+    path,
+  });
+
+  if (!params.dry_run) {
+    try {
+      await writeTextFile(runner, {
+        path,
+        content: applied.text,
+        overwrite: true,
+        createParents: false,
+        expectedSha256: original.sha256,
+        encoding: original.encoding,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("sha256 mismatch")) {
+        const current = await readTextFileDecoded(runner, path, {
+          maxBytes: maxBytes(params),
+          encoding: textEncoding,
+        });
+        return shaMismatchResponse(path, original.sha256, current);
+      }
+      throw error;
+    }
+  }
+
+  const bytes = encodeRemoteText(applied.text, original.encoding);
+  return {
+    content: [{
+      type: "text" as const,
+      text: `${params.dry_run ? "would edit" : "edited"} ${path} (${applied.replacements} replacement${applied.replacements === 1 ? "" : "s"}) sha256=${sha256Bytes(bytes)}`,
+    }],
+    structuredContent: {
+      path,
+      action: "edit",
+      replacements: applied.replacements,
+      bytes: bytes.length,
+      sha256: sha256Bytes(bytes),
+      dryRun: params.dry_run ?? false,
+      oldSha256: original.sha256,
+      encoding: original.encoding,
+      requestedEncoding: textEncoding,
+      detectedEncoding: original.detectedEncoding,
+      encodingConfidence: original.confidence,
+      encodingWarning: original.warning,
+    },
+  };
+}
+
+async function handleApplyPatch(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_apply_patch`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "patch", "dry_run", "max_bytes", "encoding"], toolName, {
+    command: `${toolName} expects "patch" containing a Codex-style patch, not "command".`,
+    content: `${toolName} expects "patch" containing a Codex-style patch, not "content".`,
+    script: `${toolName} expects "patch" containing a Codex-style patch, not "script".`,
+  });
+  const runner = options.makeRunner(params);
+  const textEncoding = requestedEncoding(params);
+  const dryRun = Boolean(params.dry_run);
+  const parsed = parsePatch(requireStringParam(params, "patch", toolName));
+  const operations = parsed.operations;
+  const warnings: PatchApplyWarning[] = [];
+
+  type PlannedOp =
+    | {
+      kind: "add";
+      path: string;
+      content: string;
+      encoding: string;
+      added: number;
+      summary: Record<string, unknown>;
+    }
+    | {
+      kind: "update";
+      path: string;
+      content: string;
+      encoding: string;
+      expectedSha256: string;
+      added: number;
+      removed: number;
+      summary: Record<string, unknown>;
+    };
+
+  const planned: PlannedOp[] = [];
+
+  for (const operation of operations) {
+    const path = resolvePath(params.root, operation.path);
+    if (operation.kind === "add") {
+      const content = textForAddedFile(operation.lines ?? []);
+      const writeEncoding = isAutoEncoding(textEncoding) ? "utf-8" : textEncoding;
+      if (!dryRun) {
+        const info = await statPath(runner, path);
+        if (info.exists) {
+          throw new Error(`Add File refused: path already exists: ${path}`);
+        }
+      }
+      const bytes = encodeRemoteText(content, writeEncoding);
+      planned.push({
+        kind: "add",
+        path,
+        content,
+        encoding: writeEncoding,
+        added: operation.lines?.length ?? 0,
+        summary: {
+          path,
+          action: "add",
+          added: operation.lines?.length ?? 0,
+          removed: 0,
+          bytes: bytes.length,
+          sha256: sha256Bytes(bytes),
+          dryRun,
+          encoding: writeEncoding,
+          requestedEncoding: textEncoding,
+        },
+      });
+      continue;
+    }
+
+    const original = await readTextFileDecoded(runner, path, {
+      maxBytes: maxBytes(params),
+      encoding: textEncoding,
+    });
+    const applied = applyUpdatePatch(original.text, operation.hunks ?? [], path);
+    warnings.push(...applied.warnings);
+    const bytes = encodeRemoteText(applied.text, original.encoding);
+    planned.push({
+      kind: "update",
+      path,
+      content: applied.text,
+      encoding: original.encoding,
+      expectedSha256: original.sha256,
+      added: applied.added,
+      removed: applied.removed,
+      summary: {
+        path,
+        action: "update",
+        added: applied.added,
+        removed: applied.removed,
+        bytes: bytes.length,
+        sha256: sha256Bytes(bytes),
+        dryRun,
+        oldSha256: original.sha256,
+        encoding: original.encoding,
+        requestedEncoding: textEncoding,
+        detectedEncoding: original.detectedEncoding,
+        encodingConfidence: original.confidence,
+        encodingWarning: original.warning,
+      },
+    });
+  }
+
+  if (!dryRun) {
+    for (const item of planned) {
+      try {
+        if (item.kind === "add") {
+          await writeTextFile(runner, {
+            path: item.path,
+            content: item.content,
+            overwrite: false,
+            createParents: true,
+            encoding: item.encoding,
+          });
+        } else {
+          await writeTextFile(runner, {
+            path: item.path,
+            content: item.content,
+            overwrite: true,
+            createParents: false,
+            expectedSha256: item.expectedSha256,
+            encoding: item.encoding,
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (item.kind === "update" && message.includes("sha256 mismatch")) {
+          const current = await readTextFileDecoded(runner, item.path, {
+            maxBytes: maxBytes(params),
+            encoding: textEncoding,
+          });
+          return shaMismatchResponse(item.path, item.expectedSha256, current);
+        }
+        throw new Error(
+          `${message} (patch write phase failed at ${item.path}; earlier files in this patch may already have been written)`,
+        );
+      }
+    }
+  }
+
+  const summaries = planned.map((item) => item.summary);
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: [
+        ...summaries.map((item) => {
+          const mode = item.dryRun ? "would " : "";
+          return `${mode}${item.action} ${item.path} (+${item.added}/-${item.removed}) sha256=${item.sha256}`;
+        }),
+        ...formatPatchWarnings(parsed.normalizations, warnings),
+      ].join("\n"),
+    }],
+    structuredContent: {
+      operations: summaries,
+      normalizations: parsed.normalizations,
+      warnings,
+    },
+  };
+}
+
+async function handleList(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_list`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path"], toolName, );
+  const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
+  const entries = await listDir(options.makeRunner(params), path);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(entries, null, 2) }],
+    structuredContent: { path, entries },
+  };
+}
+
+async function handleStat(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_stat`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path"], toolName, );
+  const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
+  const info = await statPath(options.makeRunner(params), path);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(info, null, 2) }],
+    structuredContent: info,
+  };
+}
+
+async function handleSearch(params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) {
+  const toolName = `${options.prefix}_search`;
+  rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path", "pattern", "fixed", "max_results", "encoding"], toolName, );
+  const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
+  const output = await searchText(options.makeRunner(params), {
+    path,
+    pattern: requireStringParam(params, "pattern", toolName),
+    fixed: fixedSearch(params),
+    maxResults: maxResults(params),
+    encoding: encoding(params),
+  });
+  return {
+    content: [{ type: "text" as const, text: output }],
+    structuredContent: { path, output, requestedEncoding: requestedEncoding(params) },
+  };
+}
+
+const actionHandlers: Record<string, (params: Record<string, unknown>, options: RegisterRemoteFileToolsOptions) => Promise<any>> = {
+  read: handleRead,
+  write: handleWrite,
+  edit: handleEdit,
+  apply_patch: handleApplyPatch,
+  list: handleList,
+  stat: handleStat,
+  search: handleSearch,
+};
+
+// ---------------------------------------------------------------------------
+// Legacy registration: one tool per operation (ssh_file_read, wsl_file_write, ...)
+// ---------------------------------------------------------------------------
+
 export function registerRemoteFileTools(options: RegisterRemoteFileToolsOptions): Record<string, RemoteFileToolHandler> {
   const common = commonFields(options);
-  const commonKeys = Object.keys(common);
-  const readParams = [...commonKeys, "path", "max_bytes", "encoding"];
-  const writeParams = [...commonKeys, "path", "content", "create_parents", "overwrite", "expected_sha256", "mode", "encoding"];
-  const editParams = [
-    ...commonKeys,
-    "path",
-    "old_string",
-    "new_string",
-    "replace_all",
-    "oldString",
-    "newString",
-    "replaceAll",
-    "dry_run",
-    "expected_sha256",
-    "max_bytes",
-    "encoding",
-  ];
-  const patchParams = [...commonKeys, "patch", "dry_run", "max_bytes", "encoding"];
-  const pathParams = [...commonKeys, "path"];
-  const searchParams = [...commonKeys, "path", "pattern", "fixed", "max_results", "encoding"];
   const handlers: Record<string, RemoteFileToolHandler> = {};
 
   function register(
@@ -267,13 +586,7 @@ export function registerRemoteFileTools(options: RegisterRemoteFileToolsOptions)
     {
       title: `${options.titlePrefix} Read File`,
       description: `Read a remote text file. ${options.targetDescription}
-
-The remote side only needs a basic POSIX shell plus cat/wc. File bytes are read
-raw and decoded locally. Encoding defaults to auto: UTF-8 is preferred when
-valid, and common legacy encodings such as GBK/GB18030 are tried when UTF-8 is
-invalid. The returned text content is in structuredContent.text. The text
-content entry is a short summary to avoid duplicating large file contents for
-clients that surface both content and structuredContent.`,
+Encoding defaults to auto: UTF-8 preferred, legacy encodings (GBK/GB18030) tried when UTF-8 invalid. Full text in structuredContent.text.`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -289,28 +602,7 @@ clients that surface both content and structuredContent.`,
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_read`;
-        rejectUnexpectedParams(params, readParams, toolName);
-        const runner = options.makeRunner(params);
-        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-        const decoded = await readTextFileDecoded(runner, path, {
-          maxBytes: maxBytes(params),
-          encoding: requestedEncoding(params),
-        });
-        return {
-          content: [{ type: "text" as const, text: formatReadSummary(path, decoded) }],
-          structuredContent: {
-            path,
-            text: decoded.text,
-            bytes: decoded.bytes,
-            sha256: decoded.sha256,
-            encoding: decoded.encoding,
-            requestedEncoding: decoded.requestedEncoding,
-            detectedEncoding: decoded.detectedEncoding,
-            encodingConfidence: decoded.confidence,
-            encodingWarning: decoded.warning,
-          },
-        };
+        return await handleRead(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -322,13 +614,7 @@ clients that surface both content and structuredContent.`,
     {
       title: `${options.titlePrefix} Write File`,
       description: `Write a remote text file. ${options.targetDescription}
-
-Content is encoded locally, sent as base64 through stdin, decoded by the remote
-shell into a temporary file, then moved into place. Encoding defaults to auto:
-new files are written as UTF-8, while overwriting an existing text file first
-detects and preserves that file's encoding. Pass encoding explicitly to force a
-specific encoding. Small writes can fall back to POSIX printf when base64 is not
-available on a slim remote device.`,
+Encoding auto: new files UTF-8; overwriting an existing text file preserves its detected encoding. Pass encoding to force.`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -348,30 +634,7 @@ available on a slim remote device.`,
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_write`;
-        rejectUnexpectedParams(params, writeParams, toolName);
-        const runner = options.makeRunner(params);
-        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-        const overwrite = typeof params.overwrite === "boolean" ? params.overwrite : true;
-        const writeEncoding = await resolveWriteEncoding(runner, path, params, overwrite);
-        const result = await writeTextFile(runner, {
-          path,
-          content: requireStringParam(params, "content", toolName, { allowEmpty: true }),
-          createParents: typeof params.create_parents === "boolean" ? params.create_parents : true,
-          overwrite,
-          expectedSha256: typeof params.expected_sha256 === "string" ? params.expected_sha256 : undefined,
-          mode: typeof params.mode === "string" ? params.mode : undefined,
-          encoding: writeEncoding,
-        });
-        return {
-          content: [{ type: "text" as const, text: `Wrote ${result.bytes} bytes to ${path}\nsha256: ${result.sha256}` }],
-          structuredContent: {
-            path,
-            ...result,
-            encoding: writeEncoding,
-            requestedEncoding: requestedEncoding(params),
-          },
-        };
+        return await handleWrite(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -383,14 +646,7 @@ available on a slim remote device.`,
     {
       title: `${options.titlePrefix} Edit File`,
       description: `Edit a remote text file by replacing an exact string. ${options.targetDescription}
-
-Use this for focused one-file replacements. The default behavior matches common
-editor tools: old_string must match exactly once; if it matches multiple places,
-the tool errors instead of picking one. Pass replace_all=true to replace every
-occurrence. OpenCode-style aliases oldString, newString, and replaceAll are
-accepted for compatibility. The remote file is read and decoded locally, then
-written back atomically with a sha256 guard. Encoding defaults to auto and
-preserves the detected source-file encoding.`,
+old_string must match exactly once unless replace_all=true (errors instead of guessing). Encoding auto, preserves source encoding.`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -414,73 +670,7 @@ preserves the detected source-file encoding.`,
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_edit`;
-        rejectUnexpectedParams(params, editParams, toolName);
-        const runner = options.makeRunner(params);
-        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-        const textEncoding = requestedEncoding(params);
-        const original = await readTextFileDecoded(runner, path, {
-          maxBytes: maxBytes(params),
-          encoding: textEncoding,
-        });
-
-        const expectedSha = typeof params.expected_sha256 === "string" ? params.expected_sha256 : undefined;
-        if (expectedSha && expectedSha !== original.sha256) {
-          return shaMismatchResponse(path, expectedSha, original);
-        }
-
-        const oldString = stringParamWithAlias(params, "old_string", "oldString", toolName);
-        const newString = stringParamWithAlias(params, "new_string", "newString", toolName, { allowEmpty: true });
-        const replaceAll = booleanParamWithAlias(params, "replace_all", "replaceAll", false, toolName);
-        const applied = applyTextEdit(original.text, oldString, newString, {
-          replaceAll,
-          path,
-        });
-
-        if (!params.dry_run) {
-          try {
-            await writeTextFile(runner, {
-              path,
-              content: applied.text,
-              overwrite: true,
-              createParents: false,
-              expectedSha256: original.sha256,
-              encoding: original.encoding,
-            });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            if (message.includes("sha256 mismatch")) {
-              const current = await readTextFileDecoded(runner, path, {
-                maxBytes: maxBytes(params),
-                encoding: textEncoding,
-              });
-              return shaMismatchResponse(path, original.sha256, current);
-            }
-            throw error;
-          }
-        }
-
-        const bytes = encodeRemoteText(applied.text, original.encoding);
-        return {
-          content: [{
-            type: "text" as const,
-            text: `${params.dry_run ? "would edit" : "edited"} ${path} (${applied.replacements} replacement${applied.replacements === 1 ? "" : "s"}) sha256=${sha256Bytes(bytes)}`,
-          }],
-          structuredContent: {
-            path,
-            action: "edit",
-            replacements: applied.replacements,
-            bytes: bytes.length,
-            sha256: sha256Bytes(bytes),
-            dryRun: params.dry_run ?? false,
-            oldSha256: original.sha256,
-            encoding: original.encoding,
-            requestedEncoding: textEncoding,
-            detectedEncoding: original.detectedEncoding,
-            encodingConfidence: original.confidence,
-            encodingWarning: original.warning,
-          },
-        };
+        return await handleEdit(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -491,45 +681,8 @@ preserves the detected source-file encoding.`,
     `${options.prefix}_apply_patch`,
     {
       title: `${options.titlePrefix} Apply Patch`,
-      description: `Apply a text patch to remote files. ${options.targetDescription}
-
-Patch parsing and hunk matching run locally. The remote host only performs
-basic reads and atomic writes. Supported directives: *** Add File and
-*** Update File. Delete and move patches are intentionally unsupported.
-Encoding defaults to auto: updates preserve the detected source-file encoding,
-while added files are written as UTF-8 unless encoding is passed explicitly.
-
-Use ${options.prefix}_edit for focused single-file string replacements. Use this
-tool when you need multi-file edits, multiple hunks, or *** Add File.
-
-Format (Codex-style):
-  *** Begin Patch
-  *** Update File: <path>
-  @@
-   context line (leading space)
-  -removed line
-  +added line
-  *** Add File: <path>
-  +new file content line
-  *** End Patch
-
-Rules:
-  - In update hunks, each normal line should start with a marker: space=context,
-    +=add, -=remove. The @@ line is an optional hunk separator.
-  - The marker is a patch prefix, not part of the file content. Put the marker
-    before the real line text; for an indented line like "  key: value", the
-    context patch line is "   key: value" (one marker space plus two content
-    spaces).
-  - Blank or unmarked hunk lines are tolerated as context, but every one is
-    reported in structuredContent.normalizations with patch line number and text.
-  - Every hunk must contain at least one + or - line; context-only hunks are
-    rejected because they usually mean a marker was forgotten.
-  - Hunk matching is line-based: context+removed lines must appear as a
-    contiguous subsequence in the current file, searched from the previous
-    hunk's position. If the same old block appears multiple times, the first
-    match is used and a warning is returned in structuredContent.warnings.
-  - Add File content lines must start with +. Delete File and Move are not
-    supported by this tool.`,
+      description: `Apply a Codex-style patch to remote files (Add File / Update File; Delete/Move unsupported). ${options.targetDescription}
+Multi-file edits; focused single-file replacements should use ${options.prefix}_edit. Patch format details: read the remote-execution skill.`,
       inputSchema: z.object({
         ...common,
         patch: z.string().min(1).describe("Patch text using the Codex-style *** Begin Patch format."),
@@ -546,167 +699,7 @@ Rules:
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_apply_patch`;
-        rejectUnexpectedParams(params, patchParams, toolName, {
-          command: `${toolName} expects "patch" containing a Codex-style patch, not "command".`,
-          content: `${toolName} expects "patch" containing a Codex-style patch, not "content".`,
-          script: `${toolName} expects "patch" containing a Codex-style patch, not "script".`,
-        });
-        const runner = options.makeRunner(params);
-        const textEncoding = requestedEncoding(params);
-        const dryRun = Boolean(params.dry_run);
-        const parsed = parsePatch(requireStringParam(params, "patch", toolName));
-        const operations = parsed.operations;
-        const warnings: PatchApplyWarning[] = [];
-
-        // Phase 1: fully plan in memory (read + match). No remote writes yet.
-        // Multi-file patches either all plan successfully or fail before any write.
-        type PlannedOp =
-          | {
-            kind: "add";
-            path: string;
-            content: string;
-            encoding: string;
-            added: number;
-            summary: Record<string, unknown>;
-          }
-          | {
-            kind: "update";
-            path: string;
-            content: string;
-            encoding: string;
-            expectedSha256: string;
-            added: number;
-            removed: number;
-            summary: Record<string, unknown>;
-          };
-
-        const planned: PlannedOp[] = [];
-
-        for (const operation of operations) {
-          const path = resolvePath(params.root, operation.path);
-          if (operation.kind === "add") {
-            const content = textForAddedFile(operation.lines ?? []);
-            const writeEncoding = isAutoEncoding(textEncoding) ? "utf-8" : textEncoding;
-            if (!dryRun) {
-              const info = await statPath(runner, path);
-              if (info.exists) {
-                throw new Error(`Add File refused: path already exists: ${path}`);
-              }
-            }
-            const bytes = encodeRemoteText(content, writeEncoding);
-            planned.push({
-              kind: "add",
-              path,
-              content,
-              encoding: writeEncoding,
-              added: operation.lines?.length ?? 0,
-              summary: {
-                path,
-                action: "add",
-                added: operation.lines?.length ?? 0,
-                removed: 0,
-                bytes: bytes.length,
-                sha256: sha256Bytes(bytes),
-                dryRun,
-                encoding: writeEncoding,
-                requestedEncoding: textEncoding,
-              },
-            });
-            continue;
-          }
-
-          const original = await readTextFileDecoded(runner, path, {
-            maxBytes: maxBytes(params),
-            encoding: textEncoding,
-          });
-          const applied = applyUpdatePatch(original.text, operation.hunks ?? [], path);
-          warnings.push(...applied.warnings);
-          const bytes = encodeRemoteText(applied.text, original.encoding);
-          planned.push({
-            kind: "update",
-            path,
-            content: applied.text,
-            encoding: original.encoding,
-            expectedSha256: original.sha256,
-            added: applied.added,
-            removed: applied.removed,
-            summary: {
-              path,
-              action: "update",
-              added: applied.added,
-              removed: applied.removed,
-              bytes: bytes.length,
-              sha256: sha256Bytes(bytes),
-              dryRun,
-              oldSha256: original.sha256,
-              encoding: original.encoding,
-              requestedEncoding: textEncoding,
-              detectedEncoding: original.detectedEncoding,
-              encodingConfidence: original.confidence,
-              encodingWarning: original.warning,
-            },
-          });
-        }
-
-        // Phase 2: write only after every operation planned successfully.
-        if (!dryRun) {
-          for (const item of planned) {
-            try {
-              if (item.kind === "add") {
-                await writeTextFile(runner, {
-                  path: item.path,
-                  content: item.content,
-                  overwrite: false,
-                  createParents: true,
-                  encoding: item.encoding,
-                });
-              } else {
-                await writeTextFile(runner, {
-                  path: item.path,
-                  content: item.content,
-                  overwrite: true,
-                  createParents: false,
-                  expectedSha256: item.expectedSha256,
-                  encoding: item.encoding,
-                });
-              }
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              if (item.kind === "update" && message.includes("sha256 mismatch")) {
-                const current = await readTextFileDecoded(runner, item.path, {
-                  maxBytes: maxBytes(params),
-                  encoding: textEncoding,
-                });
-                return shaMismatchResponse(item.path, item.expectedSha256, current);
-              }
-              // Partial writes may have occurred after the first successful write.
-              throw new Error(
-                `${message} (patch write phase failed at ${item.path}; earlier files in this patch may already have been written)`,
-              );
-            }
-          }
-        }
-
-        const summaries = planned.map((item) => item.summary);
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: [
-              ...summaries.map((item) => {
-                const mode = item.dryRun ? "would " : "";
-                return `${mode}${item.action} ${item.path} (+${item.added}/-${item.removed}) sha256=${item.sha256}`;
-              }),
-              ...formatPatchWarnings(parsed.normalizations, warnings),
-            ].join("\n"),
-          }],
-          structuredContent: {
-            operations: summaries,
-            normalizations: parsed.normalizations,
-            warnings,
-          },
-        };
+        return await handleApplyPatch(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -717,10 +710,7 @@ Rules:
     `${options.prefix}_list`,
     {
       title: `${options.titlePrefix} List Directory`,
-      description: `List a remote directory using basic shell tools. ${options.targetDescription}
-
-This is for quick inspection; it returns a compact text rendering plus
-structured entries with name, type, size, and mtime when available.`,
+      description: `List a remote directory (name, type, size, mtime when available). ${options.targetDescription}`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -734,14 +724,7 @@ structured entries with name, type, size, and mtime when available.`,
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_list`;
-        rejectUnexpectedParams(params, pathParams, toolName);
-        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-        const entries = await listDir(options.makeRunner(params), path);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(entries, null, 2) }],
-          structuredContent: { path, entries },
-        };
+        return await handleList(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -752,10 +735,7 @@ structured entries with name, type, size, and mtime when available.`,
     `${options.prefix}_stat`,
     {
       title: `${options.titlePrefix} Stat Path`,
-      description: `Inspect a remote path. ${options.targetDescription}
-
-This returns existence, path type, size, mode, and mtime when the remote shell
-can obtain them.`,
+      description: `Inspect a remote path: existence, type, size, mode, mtime. ${options.targetDescription}`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -769,14 +749,7 @@ can obtain them.`,
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_stat`;
-        rejectUnexpectedParams(params, pathParams, toolName);
-        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-        const info = await statPath(options.makeRunner(params), path);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(info, null, 2) }],
-          structuredContent: info,
-        };
+        return await handleStat(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -787,11 +760,8 @@ can obtain them.`,
     `${options.prefix}_search`,
     {
       title: `${options.titlePrefix} Search Text`,
-      description: `Search remote text files using grep. ${options.targetDescription}
-
-The remote host runs grep and the output bytes are decoded locally with the same
-auto/explicit encoding rules as reads. ASCII patterns are the most portable;
-non-ASCII pattern matching still depends on the remote grep and locale.`,
+      description: `Search remote text files with grep. ${options.targetDescription}
+fixed=true uses grep -F; ASCII patterns are the most portable across remote locales.`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -809,20 +779,7 @@ non-ASCII pattern matching still depends on the remote grep and locale.`,
     },
     async (params) => {
       try {
-        const toolName = `${options.prefix}_search`;
-        rejectUnexpectedParams(params, searchParams, toolName);
-        const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-        const output = await searchText(options.makeRunner(params), {
-          path,
-          pattern: requireStringParam(params, "pattern", toolName),
-          fixed: fixedSearch(params),
-          maxResults: maxResults(params),
-          encoding: encoding(params),
-        });
-        return {
-          content: [{ type: "text" as const, text: output }],
-          structuredContent: { path, output, requestedEncoding: requestedEncoding(params) },
-        };
+        return await handleSearch(params, options);
       } catch (error) {
         return errorResponse(error);
       }
@@ -830,4 +787,94 @@ non-ASCII pattern matching still depends on the remote grep and locale.`,
   );
 
   return handlers;
+}
+
+// ---------------------------------------------------------------------------
+// Unified registration: one tool per backend ({prefix}, e.g. ssh_file / wsl_file)
+// selected by REMOTE_MCP_FILE_API=unified. Reuses the same action handlers.
+// ---------------------------------------------------------------------------
+
+const unifiedActionEnum = z.enum(["read", "write", "edit", "apply_patch", "list", "stat", "search"]);
+
+function unifiedSchema(options: RegisterRemoteFileToolsOptions) {
+  const common = commonFields(options);
+  return z.object({
+    action: unifiedActionEnum,
+    ...common,
+    path: pathField,
+    content: z.string().optional().describe("Text content (write)."),
+    create_parents: z.boolean().optional().describe("Create parent directories (write)."),
+    overwrite: z.boolean().optional().describe("Allow overwrite (write)."),
+    expected_sha256: z.string().optional().describe("sha256 guard before write/edit."),
+    mode: z.string().optional().describe('chmod mode (write), e.g. "0644".'),
+    old_string: z.string().optional().describe("Exact text to replace (edit); must match once unless replace_all=true."),
+    new_string: z.string().optional().describe("Replacement text (edit)."),
+    replace_all: z.boolean().optional().describe("Replace every occurrence (edit)."),
+    dry_run: z.boolean().optional().describe("Compute without writing."),
+    patch: z.string().optional().describe("Codex-style *** Begin Patch text (apply_patch)."),
+    pattern: z.string().optional().describe("Search pattern (search)."),
+    fixed: z.boolean().optional().describe("grep -F fixed string (search)."),
+    max_results: z.number().int().positive().optional().describe("Max result lines (search)."),
+    max_bytes: z.number().int().positive().optional().describe("Maximum file size to read."),
+    encoding: encodingField,
+  }).strict().superRefine((val, ctx) => {
+    const required: Record<string, string[]> = {
+      read: ["path"],
+      write: ["path", "content"],
+      edit: ["path", "old_string", "new_string"],
+      apply_patch: ["patch"],
+      list: ["path"],
+      stat: ["path"],
+      search: ["path", "pattern"],
+    };
+    const record = val as unknown as Record<string, unknown>;
+    for (const field of required[record.action as string] ?? []) {
+      if (record[field] === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `action=${record.action} requires "${field}"`, path: [field] });
+      }
+    }
+  });
+}
+
+export function registerUnifiedRemoteFileTools(options: RegisterRemoteFileToolsOptions): Record<string, RemoteFileToolHandler> {
+  const toolName = options.prefix; // e.g. ssh_file / wsl_file
+  const handler: RemoteFileToolHandler = async (params) => {
+    const action = params.action as string;
+    const impl = actionHandlers[action];
+    if (!impl) {
+      return errorResponse(new Error(`Unknown ${toolName} action: ${action}`));
+    }
+    try {
+      // In unified mode the tool name reported to handlers should be the
+      // action tool name so existing messages stay consistent.
+      return await impl(params, { ...options, prefix: `${options.prefix}_${action}` });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  };
+  options.server.registerTool(
+    toolName,
+    {
+      title: `${options.titlePrefix} File Operations (unified)`,
+      description: `Remote file operations. ${options.targetDescription}
+action selects the operation:
+  read(path, max_bytes?, encoding?) - read text file (text in structuredContent.text)
+  write(path, content, create_parents?, overwrite?, expected_sha256?, mode?, encoding?) - write text file
+  edit(path, old_string, new_string, replace_all?, dry_run?, expected_sha256?, max_bytes?, encoding?) - replace exact text once
+  apply_patch(patch, dry_run?, max_bytes?, encoding?) - Codex-style patch (Add/Update File)
+  list(path) - list directory
+  stat(path) - inspect path
+  search(path, pattern, fixed?, max_results?, encoding?) - grep search
+Encoding defaults to auto (UTF-8 preferred; GBK/GB18030 fallback; overwrites preserve existing encoding).`,
+      inputSchema: unifiedSchema(options),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    handler,
+  );
+  return { [toolName]: handler };
 }
