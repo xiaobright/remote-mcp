@@ -45,8 +45,6 @@ WSL:
 - `wsl_file_write`
 - `wsl_file_edit`
 - `wsl_file_apply_patch`
-- `wsl_file_list`
-- `wsl_file_stat`
 - `wsl_file_search`
 
 SSH:
@@ -60,8 +58,6 @@ SSH:
 - `ssh_file_write`
 - `ssh_file_edit`
 - `ssh_file_apply_patch`
-- `ssh_file_list`
-- `ssh_file_stat`
 - `ssh_file_search`
 
 ## 任务模型
@@ -77,28 +73,33 @@ SSH:
 
 简单替换优先用 `*_file_edit`：
 
-- `old_string` 必须精确匹配。
-- 默认只允许匹配一次；多匹配会报错。
+- `old_string` 必须精确匹配；CRLF 文件即使用 LF 的 old_string 也能匹配，并保留 CRLF。
+- 默认只允许匹配一次；多匹配报错并列出各匹配行号。
+- 0 次匹配时报错含最接近区域（行号 + JSON 转义文本）、空白差异提示和修复指引，而不是一句干巴巴的 "did not match"。
 - `replace_all=true` 时替换所有匹配项。
-- 兼容 OpenCode 常见参数名：`oldString`、`newString`、`replaceAll`。
-- 可传 `expected_sha256` 做乐观锁；冲突时返回当前文件内容和当前 sha256。
+- 兼容常见参数名别名：`oldString`、`newString`、`replaceAll`。
+- 可传 `expected_sha256`（来自 read 返回）做乐观锁；冲突时报错并给出当前 sha256，重读重试即可。
+- 成功返回 unified diff 和新 sha256，同回合即可核对；`dry_run=true` 只预览不落盘。
 
 复杂修改用 `*_file_apply_patch`：
 
 - 支持 `*** Add File` 和 `*** Update File`。
 - 不支持 delete/move，避免模型在大 patch 里顺手删除文件。
+- unified diff 头（`--- a/x`、`+++ b/x`、`diff --git`）与 `@@ -a,b +c,d @@` 计数头会被显式拒绝并提示格式，混用格式不会静默写坏文件。
 - hunk 匹配在本地完成，按 context+removed 行作为连续 subsequence 查找。
 - **两阶段应用**：先对所有文件完成读入与 hunk 匹配，再统一写入；规划阶段失败时不会写任何文件。写入阶段若中途失败，错误会注明可能已部分写入。
 - 空行或无 marker 行会被当作 context，但会写入 `structuredContent.normalizations`。
 - 重复匹配会写入 `structuredContent.warnings`。
+- 成功返回每个文件的 unified diff；`dry_run=true` 只预览。
 
 ## 返回形状
 
 工具返回 MCP 的 `content` 和 `structuredContent`：
 
 - `content` 给人或模型快速扫结果。
-- `structuredContent` 放稳定字段，例如 path、sha256、bytes、encoding、warnings。
-- 文件读取的全文在 `structuredContent.text`，`content[0].text` 只放摘要，避免客户端同时展示两份大文本。
+- `structuredContent` 放稳定字段，例如 path、sha256、bytes、encoding、diff、warnings。
+- 文件读取的全文放在 `content`（所有客户端都会透传给模型，包括不渲染 `structuredContent` 的）；`structuredContent` 只放元数据，避免大文本双份。
+- list/stat 工具已移除（省上下文；列目录/查属性用 exec 跑 `ls`/`stat`）。
 
 ## 构建与测试
 

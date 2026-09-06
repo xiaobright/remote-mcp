@@ -59,6 +59,15 @@ export function parsePatch(input) {
             while (index < lines.length && !lines[index].startsWith("*** ")) {
                 const currentLine = lines[index];
                 const patchLine = index + 1;
+                if (/^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/.test(currentLine.trim())) {
+                    throw new Error(`Unified diff hunk header "${currentLine}" is not supported. Use a bare @@ as the hunk separator; line counts are not needed.`);
+                }
+                if (/^(--- |\+\+\+ |diff --git )/.test(currentLine)) {
+                    throw new Error(`Unified diff file header "${currentLine}" is not supported. This tool uses the Codex patch format: `
+                        + `*** Begin Patch / *** Update File: <path> / @@ / lines prefixed with ' ' (context), '+' (added) or '-' (removed) / *** End Patch. `
+                        + `Remove the ---/+++/diff headers and mark every hunk line. `
+                        + `(If a line you are removing genuinely starts with "--", include more surrounding context lines and use the edit tool instead.)`);
+                }
                 if (currentLine.startsWith("@@")) {
                     pushHunk(hunks, current, path, currentPatchLine);
                     current = [];

@@ -2,8 +2,9 @@ import { z } from "zod";
 import { errorResponse, rejectUnexpectedParams, requireStringParam, } from "../mcp.js";
 import { joinRemotePath } from "../shell.js";
 import { applyTextEdit } from "./edit.js";
+import { unifiedDiff } from "./diff.js";
 import { applyUpdatePatch, parsePatch, textForAddedFile, } from "./patch.js";
-import { encodeRemoteText, listDir, readTextFileDecoded, searchText, sha256Bytes, statPath, writeTextFile, } from "./remoteOps.js";
+import { encodeRemoteText, readTextFileDecoded, searchText, sha256Bytes, statPath, writeTextFile, } from "./remoteOps.js";
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 const rootField = z.string()
     .optional()
@@ -88,16 +89,15 @@ function shaMismatchResponse(path, expected, current) {
         content: [{
                 type: "text",
                 text: [
-                    `Error: expected_sha256 mismatch for ${path}`,
+                    `Error: expected_sha256 mismatch for ${path} — the file changed since you last read it.`,
                     `expected: ${expected}`,
                     `actual:   ${current.sha256}`,
-                    "current text: structuredContent.text",
+                    `Re-read the file to get fresh content and its sha256, then retry with updated old_string/expected_sha256.`,
                 ].join("\n"),
             }],
         isError: true,
         structuredContent: {
             path,
-            text: current.text,
             bytes: current.bytes,
             sha256: current.sha256,
             encoding: current.encoding,
@@ -118,17 +118,29 @@ function formatPatchWarnings(normalizations, warnings) {
     }
     return lines;
 }
-function formatReadSummary(path, decoded) {
+function formatReadResponse(path, decoded) {
     const lines = [
-        `Read ${decoded.bytes} bytes from ${path}`,
-        `sha256: ${decoded.sha256}`,
-        `encoding: ${decoded.encoding} (requested: ${decoded.requestedEncoding}, detected: ${decoded.detectedEncoding}, confidence: ${decoded.confidence})`,
-        "text: structuredContent.text",
+        `Read ${decoded.bytes} bytes from ${path} (encoding: ${decoded.encoding}, sha256: ${decoded.sha256})`,
     ];
     if (decoded.warning) {
         lines.push(`warning: ${decoded.warning}`);
     }
-    return lines.join("\n");
+    // Full text goes in the text content so every MCP client surfaces it,
+    // including ones that do not pass structuredContent to the model.
+    lines.push(decoded.text);
+    return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        structuredContent: {
+            path,
+            bytes: decoded.bytes,
+            sha256: decoded.sha256,
+            encoding: decoded.encoding,
+            requestedEncoding: decoded.requestedEncoding,
+            detectedEncoding: decoded.detectedEncoding,
+            encodingConfidence: decoded.confidence,
+            encodingWarning: decoded.warning,
+        },
+    };
 }
 function commonFields(options) {
     return {
@@ -148,20 +160,7 @@ async function handleRead(params, options) {
         maxBytes: maxBytes(params),
         encoding: requestedEncoding(params),
     });
-    return {
-        content: [{ type: "text", text: formatReadSummary(path, decoded) }],
-        structuredContent: {
-            path,
-            text: decoded.text,
-            bytes: decoded.bytes,
-            sha256: decoded.sha256,
-            encoding: decoded.encoding,
-            requestedEncoding: decoded.requestedEncoding,
-            detectedEncoding: decoded.detectedEncoding,
-            encodingConfidence: decoded.confidence,
-            encodingWarning: decoded.warning,
-        },
-    };
+    return formatReadResponse(path, decoded);
 }
 async function handleWrite(params, options) {
     const toolName = `${options.prefix}_write`;
@@ -189,6 +188,7 @@ async function handleWrite(params, options) {
         },
     };
 }
+const EDIT_DIFF_MAX_LINES = 400;
 async function handleEdit(params, options) {
     const toolName = `${options.prefix}_edit`;
     rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path", "old_string", "new_string", "replace_all", "oldString", "newString", "replaceAll", "dry_run", "expected_sha256", "max_bytes", "encoding"], toolName);
@@ -209,7 +209,10 @@ async function handleEdit(params, options) {
     const applied = applyTextEdit(original.text, oldString, newString, {
         replaceAll,
         path,
+        hint: `To fix: call ${options.prefix}_read on this file and copy old_string verbatim from its output, then retry.`,
     });
+    const bytes = encodeRemoteText(applied.text, original.encoding);
+    const diff = unifiedDiff(original.text, applied.text, path, { maxLines: EDIT_DIFF_MAX_LINES });
     if (!params.dry_run) {
         try {
             await writeTextFile(runner, {
@@ -233,12 +236,18 @@ async function handleEdit(params, options) {
             throw error;
         }
     }
-    const bytes = encodeRemoteText(applied.text, original.encoding);
+    const contentLines = [
+        `${params.dry_run ? "Would edit" : "Edited"} ${path} (${applied.replacements} replacement${applied.replacements === 1 ? "" : "s"}${applied.lineEndingsNormalized ? ", CRLF line endings preserved" : ""}, sha256: ${sha256Bytes(bytes)})`,
+        diff.diff,
+    ];
+    if (diff.truncated) {
+        contentLines.push(`(diff truncated at ${EDIT_DIFF_MAX_LINES} lines)`);
+    }
+    if (params.dry_run) {
+        contentLines.push("(dry run: nothing was written)");
+    }
     return {
-        content: [{
-                type: "text",
-                text: `${params.dry_run ? "would edit" : "edited"} ${path} (${applied.replacements} replacement${applied.replacements === 1 ? "" : "s"}) sha256=${sha256Bytes(bytes)}`,
-            }],
+        content: [{ type: "text", text: contentLines.filter(Boolean).join("\n") }],
         structuredContent: {
             path,
             action: "edit",
@@ -247,6 +256,9 @@ async function handleEdit(params, options) {
             sha256: sha256Bytes(bytes),
             dryRun: params.dry_run ?? false,
             oldSha256: original.sha256,
+            diff: diff.diff,
+            diffTruncated: diff.truncated,
+            lineEndingsNormalized: applied.lineEndingsNormalized,
             encoding: original.encoding,
             requestedEncoding: textEncoding,
             detectedEncoding: original.detectedEncoding,
@@ -281,12 +293,15 @@ async function handleApplyPatch(params, options) {
                 }
             }
             const bytes = encodeRemoteText(content, writeEncoding);
+            const diff = unifiedDiff("", content, path, { maxLines: EDIT_DIFF_MAX_LINES });
             planned.push({
                 kind: "add",
                 path,
                 content,
                 encoding: writeEncoding,
                 added: operation.lines?.length ?? 0,
+                diff: diff.diff,
+                diffTruncated: diff.truncated,
                 summary: {
                     path,
                     action: "add",
@@ -295,6 +310,8 @@ async function handleApplyPatch(params, options) {
                     bytes: bytes.length,
                     sha256: sha256Bytes(bytes),
                     dryRun,
+                    diff: diff.diff,
+                    diffTruncated: diff.truncated,
                     encoding: writeEncoding,
                     requestedEncoding: textEncoding,
                 },
@@ -308,6 +325,7 @@ async function handleApplyPatch(params, options) {
         const applied = applyUpdatePatch(original.text, operation.hunks ?? [], path);
         warnings.push(...applied.warnings);
         const bytes = encodeRemoteText(applied.text, original.encoding);
+        const diff = unifiedDiff(original.text, applied.text, path, { maxLines: EDIT_DIFF_MAX_LINES });
         planned.push({
             kind: "update",
             path,
@@ -316,6 +334,8 @@ async function handleApplyPatch(params, options) {
             expectedSha256: original.sha256,
             added: applied.added,
             removed: applied.removed,
+            diff: diff.diff,
+            diffTruncated: diff.truncated,
             summary: {
                 path,
                 action: "update",
@@ -324,6 +344,8 @@ async function handleApplyPatch(params, options) {
                 bytes: bytes.length,
                 sha256: sha256Bytes(bytes),
                 dryRun,
+                diff: diff.diff,
+                diffTruncated: diff.truncated,
                 oldSha256: original.sha256,
                 encoding: original.encoding,
                 requestedEncoding: textEncoding,
@@ -370,42 +392,26 @@ async function handleApplyPatch(params, options) {
         }
     }
     const summaries = planned.map((item) => item.summary);
+    const outputLines = summaries.map((item) => {
+        const mode = item.dryRun ? "would " : "";
+        return `${mode}${item.action} ${item.path} (+${item.added}/-${item.removed}) sha256=${item.sha256}`;
+    });
+    for (const item of planned) {
+        if (item.diff) {
+            outputLines.push(item.diff);
+            if (item.diffTruncated) {
+                outputLines.push(`(diff truncated at ${EDIT_DIFF_MAX_LINES} lines)`);
+            }
+        }
+    }
+    outputLines.push(...formatPatchWarnings(parsed.normalizations, warnings));
     return {
-        content: [{
-                type: "text",
-                text: [
-                    ...summaries.map((item) => {
-                        const mode = item.dryRun ? "would " : "";
-                        return `${mode}${item.action} ${item.path} (+${item.added}/-${item.removed}) sha256=${item.sha256}`;
-                    }),
-                    ...formatPatchWarnings(parsed.normalizations, warnings),
-                ].join("\n"),
-            }],
+        content: [{ type: "text", text: outputLines.join("\n") }],
         structuredContent: {
             operations: summaries,
             normalizations: parsed.normalizations,
             warnings,
         },
-    };
-}
-async function handleList(params, options) {
-    const toolName = `${options.prefix}_list`;
-    rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path"], toolName);
-    const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-    const entries = await listDir(options.makeRunner(params), path);
-    return {
-        content: [{ type: "text", text: JSON.stringify(entries, null, 2) }],
-        structuredContent: { path, entries },
-    };
-}
-async function handleStat(params, options) {
-    const toolName = `${options.prefix}_stat`;
-    rejectUnexpectedParams(params, [...Object.keys(commonFields(options)), "path"], toolName);
-    const path = resolvePath(params.root, requireStringParam(params, "path", toolName));
-    const info = await statPath(options.makeRunner(params), path);
-    return {
-        content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
-        structuredContent: info,
     };
 }
 async function handleSearch(params, options) {
@@ -429,8 +435,6 @@ const actionHandlers = {
     write: handleWrite,
     edit: handleEdit,
     apply_patch: handleApplyPatch,
-    list: handleList,
-    stat: handleStat,
     search: handleSearch,
 };
 // ---------------------------------------------------------------------------
@@ -445,8 +449,8 @@ export function registerRemoteFileTools(options) {
     }
     register(`${options.prefix}_read`, {
         title: `${options.titlePrefix} Read File`,
-        description: `Read a remote text file. ${options.targetDescription}
-Encoding defaults to auto: UTF-8 preferred, legacy encodings (GBK/GB18030) tried when UTF-8 invalid. Full text in structuredContent.text.`,
+        description: `Read a remote text file and return its full text. ${options.targetDescription}
+Prefer over cat: encoding auto-detected (UTF-8/GBK/UTF-16), size-capped, binary-safe. The returned sha256 doubles as expected_sha256 for write/edit. Workflow details: read the remote-execution skill.`,
         inputSchema: z.object({
             ...common,
             path: pathField,
@@ -469,8 +473,8 @@ Encoding defaults to auto: UTF-8 preferred, legacy encodings (GBK/GB18030) tried
     });
     register(`${options.prefix}_write`, {
         title: `${options.titlePrefix} Write File`,
-        description: `Write a remote text file. ${options.targetDescription}
-Encoding auto: new files UTF-8; overwriting an existing text file preserves its detected encoding. Pass encoding to force.`,
+        description: `Write or create a remote text file. ${options.targetDescription}
+Prefer over heredoc/echo: base64 transport (no quoting pitfalls), temp file + atomic rename, parents auto-created. expected_sha256 (from read) guards against overwriting changes. Encoding auto: new files UTF-8, overwrites preserve detected encoding; pass encoding to force.`,
         inputSchema: z.object({
             ...common,
             path: pathField,
@@ -497,8 +501,8 @@ Encoding auto: new files UTF-8; overwriting an existing text file preserves its 
     });
     register(`${options.prefix}_edit`, {
         title: `${options.titlePrefix} Edit File`,
-        description: `Edit a remote text file by replacing an exact string. ${options.targetDescription}
-old_string must match exactly once unless replace_all=true (errors instead of guessing). Encoding auto, preserves source encoding.`,
+        description: `Edit a remote text file by exact string replacement. ${options.targetDescription}
+Prefer over sed/python: no escaping pitfalls, loud failure instead of silent no-op, atomic + encoding-preserving. Read the file first and copy old_string verbatim; must match exactly once unless replace_all=true. CRLF auto-matched; mismatch errors include the closest region. Returns a unified diff.`,
         inputSchema: z.object({
             ...common,
             path: pathField,
@@ -530,7 +534,7 @@ old_string must match exactly once unless replace_all=true (errors instead of gu
     register(`${options.prefix}_apply_patch`, {
         title: `${options.titlePrefix} Apply Patch`,
         description: `Apply a Codex-style patch to remote files (Add File / Update File; Delete/Move unsupported). ${options.targetDescription}
-Multi-file edits; focused single-file replacements should use ${options.prefix}_edit.
+Prefer over sed/python for multi-file or multi-hunk changes; single-string replacements can use ${options.prefix}_edit.
 Format:
 *** Begin Patch
 *** Update File: <path>
@@ -541,7 +545,7 @@ Format:
 *** Add File: <path>
 +new file content line
 *** End Patch
-Update hunk lines need a marker each: space=context, +=added, -=removed.`,
+Every hunk line needs a marker: space=context, +=added, -=removed. Returns a unified diff; dry_run=true previews.`,
         inputSchema: z.object({
             ...common,
             patch: z.string().min(1).describe("Patch text using the Codex-style *** Begin Patch format."),
@@ -563,52 +567,10 @@ Update hunk lines need a marker each: space=context, +=added, -=removed.`,
             return errorResponse(error);
         }
     });
-    register(`${options.prefix}_list`, {
-        title: `${options.titlePrefix} List Directory`,
-        description: `List a remote directory (name, type, size, mtime when available). ${options.targetDescription}`,
-        inputSchema: z.object({
-            ...common,
-            path: pathField,
-        }).strict(),
-        annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-        },
-    }, async (params) => {
-        try {
-            return await handleList(params, options);
-        }
-        catch (error) {
-            return errorResponse(error);
-        }
-    });
-    register(`${options.prefix}_stat`, {
-        title: `${options.titlePrefix} Stat Path`,
-        description: `Inspect a remote path: existence, type, size, mode, mtime. ${options.targetDescription}`,
-        inputSchema: z.object({
-            ...common,
-            path: pathField,
-        }).strict(),
-        annotations: {
-            readOnlyHint: true,
-            destructiveHint: false,
-            idempotentHint: true,
-            openWorldHint: true,
-        },
-    }, async (params) => {
-        try {
-            return await handleStat(params, options);
-        }
-        catch (error) {
-            return errorResponse(error);
-        }
-    });
     register(`${options.prefix}_search`, {
         title: `${options.titlePrefix} Search Text`,
         description: `Search remote text files with grep. ${options.targetDescription}
-fixed=true uses grep -F; ASCII patterns are the most portable across remote locales.`,
+Returns grep -RIn output (path:line:text), capped at max_results. fixed=true (default) is literal grep -F; false for regex. ASCII patterns are most portable across remote locales.`,
         inputSchema: z.object({
             ...common,
             path: pathField,
@@ -637,7 +599,7 @@ fixed=true uses grep -F; ASCII patterns are the most portable across remote loca
 // Unified registration: one tool per backend ({prefix}, e.g. ssh_file / wsl_file)
 // selected by REMOTE_MCP_FILE_API=unified. Reuses the same action handlers.
 // ---------------------------------------------------------------------------
-const unifiedActionEnum = z.enum(["read", "write", "edit", "apply_patch", "list", "stat", "search"]);
+const unifiedActionEnum = z.enum(["read", "write", "edit", "apply_patch", "search"]);
 function unifiedSchema(options) {
     const common = commonFields(options);
     return z.object({
@@ -685,15 +647,14 @@ export function registerUnifiedRemoteFileTools(options) {
     options.server.registerTool(toolName, {
         title: `${options.titlePrefix} File Operations (unified)`,
         description: `Remote file operations. ${options.targetDescription}
+Prefer over sed/cat/heredoc one-liners: encoding-safe, quoting-free, atomic writes, loud failures. Workflow details: read the remote-execution skill.
 action selects the operation:
-  read(path, max_bytes?, encoding?) - read text file (text in structuredContent.text)
-  write(path, content, create_parents?, overwrite?, expected_sha256?, mode?, encoding?) - write text file
-  edit(path, old_string, new_string, replace_all?, dry_run?, expected_sha256?, max_bytes?, encoding?) - replace exact text once
-  apply_patch(patch, dry_run?, max_bytes?, encoding?) - Codex-style patch (Add/Update File; format: *** Begin Patch / *** Update File: <path> / @@ / space=context, -=removed, +=added / *** Add File: <path> / *** End Patch)
-  list(path) - list directory
-  stat(path) - inspect path
-  search(path, pattern, fixed?, max_results?, encoding?) - grep search
-Encoding defaults to auto (UTF-8 preferred; GBK/GB18030 fallback; overwrites preserve existing encoding).`,
+  read(path, max_bytes?, encoding?) - read text file; full text in the text content
+  write(path, content, create_parents?, overwrite?, expected_sha256?, mode?, encoding?) - write/create text file
+  edit(path, old_string, new_string, replace_all?, dry_run?, expected_sha256?, max_bytes?, encoding?) - exact replace once; CRLF auto-matched; returns unified diff
+  apply_patch(patch, dry_run?, max_bytes?, encoding?) - Codex-style patch (*** Begin Patch / *** Update File: <path> / @@ / space=context, -=removed, +=added / *** Add File: <path> / *** End Patch); returns unified diff
+  search(path, pattern, fixed?, max_results?, encoding?) - grep search (grep -RIn output)
+Encoding auto (UTF-8 preferred; GBK fallback; overwrites preserve encoding). read's sha256 doubles as expected_sha256 staleness guard.`,
         inputSchema: unifiedSchema(options),
         annotations: {
             readOnlyHint: false,

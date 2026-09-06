@@ -71,4 +71,45 @@ describe("textForAddedFile", () => {
         assert.equal(textForAddedFile([]), "");
     });
 });
+describe("unified diff format guards", () => {
+    it("rejects --- +++ unified diff file headers with guidance", () => {
+        const patch = [
+            "*** Update File: f",
+            "--- a/f",
+            "+++ b/f",
+            "@@",
+            "-old",
+            "+new",
+        ].join("\n");
+        assert.throws(() => parsePatch(patch), /Unified diff file header/);
+    });
+    it("rejects unified diff hunk headers with counts", () => {
+        const patch = [
+            "*** Update File: f",
+            "@@ -1,2 +1,2 @@",
+            "-old",
+            "+new",
+        ].join("\n");
+        assert.throws(() => parsePatch(patch), /Unified diff hunk header/);
+    });
+    it("rejects diff --git lines", () => {
+        const patch = [
+            "*** Update File: f",
+            "diff --git a/f b/f",
+            "-old",
+            "+new",
+        ].join("\n");
+        assert.throws(() => parsePatch(patch), /Unified diff file header/);
+    });
+    it("still accepts a bare @@ separator", () => {
+        const patch = [
+            "*** Update File: f",
+            "@@",
+            "-old",
+            "+new",
+        ].join("\n");
+        const parsed = parsePatch(patch);
+        assert.equal(parsed.operations.length, 1);
+    });
+});
 //# sourceMappingURL=patch.test.js.map

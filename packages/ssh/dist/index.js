@@ -495,7 +495,8 @@ task dies when this MCP process exits; use ssh_job for work that must survive MC
 server.registerTool("ssh_exec", {
     title: "Run SSH Command",
     description: `Execute a shell command on a remote SSH target. Command is sent via stdin to the remote shell, avoiding Windows quoting issues (pipes, $(), heredocs, nested quotes).
-Each call starts a fresh ssh process. Prefer sync for ordinary commands and long builds/tests; mode="async"/"watch" + ssh_task for background work. For complex multi-line commands use ssh_script.`,
+Each call starts a fresh ssh process. Prefer sync for ordinary commands and long builds/tests; mode="async"/"watch" + ssh_task for background work. For complex multi-line commands use ssh_script.
+For reading or editing files on the target, prefer the ssh_file_* tools (encoding-safe, no quoting pitfalls, atomic guarded writes).`,
     inputSchema: z.object({
         command: z.string()
             .min(1, "command is required")
@@ -558,7 +559,8 @@ Each call starts a fresh ssh process. Prefer sync for ordinary commands and long
 server.registerTool("ssh_script", {
     title: "Run SSH Script",
     description: `Execute a multi-line shell script on a remote SSH target. Script is passed via stdin to the remote shell; prefer this over ssh_exec for pipes, $(), loops, heredocs, and quoting.
-No persistent session: one ssh child process per call. Prefer sync for ordinary work; mode="async"/"watch" + ssh_task for background. Parameter names match wsl_script.`,
+No persistent session: one ssh child process per call. Prefer sync for ordinary work; mode="async"/"watch" + ssh_task for background. Parameter names match wsl_script.
+For reading or editing files on the target, prefer the ssh_file_* tools (encoding-safe, no quoting pitfalls, atomic guarded writes).`,
     inputSchema: z.object({
         script: z.string()
             .min(1, "script is required")

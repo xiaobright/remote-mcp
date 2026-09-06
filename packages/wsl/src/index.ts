@@ -619,7 +619,8 @@ server.registerTool(
     title: "Run WSL Command",
     description: `Execute a shell command inside this MCP process's WSL session. Avoids wsl.exe quoting traps for pipes, redirection, $(), and nested quotes.
 Each call uses a fresh shell; keepalive keeps the distro warm (auto-start on demand). Deletes under /mnt are blocked on purpose: delete Windows paths on the host, not through WSL.
-Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. Complex multi-line commands: use wsl_script.`,
+Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. Complex multi-line commands: use wsl_script.
+For reading or editing files inside WSL, prefer the wsl_file_* tools (encoding-safe, no quoting pitfalls, atomic guarded writes).`,
     inputSchema: z.object({
       command: z.string()
         .min(1, "command is required")

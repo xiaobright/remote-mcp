@@ -35,9 +35,44 @@ for (const [name, serverPath, toolName] of [
       "write",
       "edit",
       "apply_patch",
-      "list",
-      "stat",
       "search",
     ]);
+  });
+}
+
+async function listLegacyTools(serverPath) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [serverPath],
+  });
+  const client = new Client({ name: "tool-schema-test-legacy", version: "1.0.0" });
+  try {
+    await client.connect(transport);
+    return (await client.listTools()).tools;
+  } finally {
+    await client.close();
+  }
+}
+
+for (const [name, serverPath, prefix] of [
+  ["SSH", "packages/ssh/dist/index.js", "ssh_file_"],
+  ["WSL", "packages/wsl/dist/index.js", "wsl_file_"],
+]) {
+  test(`${name} legacy mode registers exactly the five file tools`, async () => {
+    const tools = await listLegacyTools(serverPath);
+    const fileTools = tools.map((item) => item.name).filter((item) => item.startsWith(prefix));
+    assert.deepEqual(fileTools.sort(), [
+      `${prefix}apply_patch`,
+      `${prefix}edit`,
+      `${prefix}read`,
+      `${prefix}search`,
+      `${prefix}write`,
+    ]);
+    for (const tool of tools.filter((item) => item.name.startsWith(prefix))) {
+      if (tool.name === `${prefix}read`) {
+        assert.ok(tool.description.includes("remote-execution skill"), `${tool.name} description should point at the skill`);
+      }
+      assert.ok(tool.description.length < 700, `${tool.name} description should stay lean`);
+    }
   });
 }
