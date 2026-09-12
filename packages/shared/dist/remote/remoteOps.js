@@ -415,48 +415,6 @@ printf 'mtime\\t%s\\n' "$mtime"
     }
     return info;
 }
-export async function listDir(target, path) {
-    const script = `set -eu
-path=${shellQuote(path)}
-if [ ! -d "$path" ]; then
-  printf 'remote_list: not a directory: %s\\n' "$path" >&2
-  exit 68
-fi
-for p in "$path"/* "$path"/.[!.]* "$path"/..?*; do
-  [ -e "$p" ] || [ -L "$p" ] || continue
-  name=\${p##*/}
-  if [ -L "$p" ]; then type=symlink
-  elif [ -d "$p" ]; then type=directory
-  elif [ -f "$p" ]; then type=file
-  else type=other
-  fi
-  size=
-  if [ "$type" = "file" ]; then
-    size=$(wc -c < "$p" 2>/dev/null | tr -d ' ' || true)
-  fi
-  mtime=$(stat -c '%Y' "$p" 2>/dev/null || stat -f '%m' "$p" 2>/dev/null || true)
-  printf '%s\\0%s\\0%s\\0%s\\0' "$name" "$type" "$size" "$mtime"
-done
-`;
-    const result = await runWith(target, script);
-    requireSuccess("list", result);
-    const fields = result.stdout.toString("utf8").split("\0");
-    const entries = [];
-    for (let index = 0; index + 3 < fields.length; index += 4) {
-        const [name, type, size, mtime] = fields.slice(index, index + 4);
-        if (!name) {
-            continue;
-        }
-        entries.push({
-            name,
-            type,
-            size: size ? Number(size) : undefined,
-            mtime: mtime ? Number(mtime) : undefined,
-        });
-    }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    return entries;
-}
 export async function searchText(target, options) {
     const fixedFlag = options.fixed ?? true ? "F" : "";
     const maxResults = options.maxResults ?? 100;

@@ -38,7 +38,7 @@ const fileToolOptions = {
         });
     },
 };
-// REMOTE_MCP_FILE_API=unified 时把 7 个 wsl_file_* 合并为 1 个 wsl_file（action 区分）
+// REMOTE_MCP_FILE_API=unified 时把 5 个 wsl_file_* 合并为 1 个 wsl_file（action 区分）
 if (process.env.REMOTE_MCP_FILE_API === "unified") {
     registerUnifiedRemoteFileTools(fileToolOptions);
 }

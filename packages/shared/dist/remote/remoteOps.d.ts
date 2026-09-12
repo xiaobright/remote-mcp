@@ -31,13 +31,6 @@ export interface RemoteFileInfo {
     mtime?: number;
     [key: string]: unknown;
 }
-export interface RemoteListEntry {
-    name: string;
-    type: string;
-    size?: number;
-    mtime?: number;
-    [key: string]: unknown;
-}
 export declare function sha256Text(text: string, encoding?: string): string;
 export declare function sha256Bytes(bytes: Buffer): string;
 export declare function detectRemoteTextEncoding(bytes: Buffer): Omit<RemoteTextDecodeResult, "bytes" | "sha256">;
@@ -60,7 +53,6 @@ export declare function writeTextFile(target: RemoteRunner, options: {
     sha256: string;
 }>;
 export declare function statPath(target: RemoteRunner, path: string): Promise<RemoteFileInfo>;
-export declare function listDir(target: RemoteRunner, path: string): Promise<RemoteListEntry[]>;
 export declare function searchText(target: RemoteRunner, options: {
     path: string;
     pattern: string;

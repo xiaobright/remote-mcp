@@ -45,8 +45,6 @@ WSL:
 - `wsl_file_write`
 - `wsl_file_edit`
 - `wsl_file_apply_patch`
-- `wsl_file_list`
-- `wsl_file_stat`
 - `wsl_file_search`
 
 SSH:
@@ -60,9 +58,18 @@ SSH:
 - `ssh_file_write`
 - `ssh_file_edit`
 - `ssh_file_apply_patch`
-- `ssh_file_list`
-- `ssh_file_stat`
 - `ssh_file_search`
+
+With `REMOTE_MCP_FILE_API=unified`, the five `*_file_*` tools of each server merge into a single `*_file` tool whose `action` selects `read`/`write`/`edit`/`apply_patch`/`search`.
+
+## Task Model
+
+| Kind | Tools | Lifetime | Notes |
+|------|-------|----------|-------|
+| attached task | `*_exec`/`*_script` with mode=`async`/`watch` plus `*_task` | tied to the MCP process | output is readable while the local child (ssh/wsl.exe) is alive |
+| persistent job | `*_job` | survives MCP restarts | runs detached via setsid inside the remote/WSL host; cancel verifies the session-leader PID before killing |
+
+`*_task` cancel tries to kill the local process tree (on Windows via `taskkill /T`); processes that already daemonized on the remote side may survive. For long work that must outlive the MCP process, use `*_job`.
 
 ## File Editing Model
 
@@ -71,7 +78,7 @@ Use `*_file_edit` for simple replacements:
 - `old_string` must match exactly.
 - The default requires one unique match; multiple matches return an error.
 - `replace_all=true` replaces every match.
-- OpenCode-style aliases are accepted: `oldString`, `newString`, `replaceAll`.
+- OpenCode-style aliases `oldString`, `newString`, `replaceAll` are accepted by the split per-tool API; with `REMOTE_MCP_FILE_API=unified` only the canonical `old_string`/`new_string`/`replace_all` are accepted.
 - `expected_sha256` can be used as an optimistic lock. Conflicts return the current file text and current sha256.
 
 Use `*_file_apply_patch` for more complex changes:
@@ -88,7 +95,7 @@ Tools return MCP `content` plus `structuredContent`:
 
 - `content` is a compact human/model-readable summary.
 - `structuredContent` contains stable fields such as path, sha256, bytes, encoding, and warnings.
-- Full file reads are returned in `structuredContent.text`; `content[0].text` contains only a short summary to avoid duplicating large text in clients that display both fields.
+- Full file reads are returned in the text content, so clients that do not forward `structuredContent` still see them; `structuredContent` carries only metadata (path, bytes, sha256, encoding).
 
 ## Build
 
@@ -142,6 +149,20 @@ MCP client configuration formats vary. Adjust field names and paths for your cli
 - `*_file_apply_patch` does not support file deletion.
 - The WSL tools protect common recursive delete operations under `/mnt` by default.
 - This project is AI-generated. Review it according to your own threat model before use.
+
+## Environment Variables
+
+| Variable | Purpose |
+|------|------|
+| `SSH_MCP_DEFAULT_TARGET` | default SSH target or device name |
+| `SSH_MCP_DEVICES_PATH` | device profile file path |
+| `SSH_MCP_STRICT_HOST_KEY_CHECKING` | defaults to `accept-new` |
+| `SSH_MCP_BATCH_MODE` | set to `0` to disable BatchMode |
+| `WSL_MCP_DEFAULT_DISTRO` | default WSL distro |
+| `WSL_MCP_PROTECT_MNT_DELETE` | set to `0` to disable /mnt delete protection |
+| `REMOTE_MCP_FILE_API` | `unified` merges the five `*_file_*` tools into one `*_file` (action-selected); unset keeps them split |
+| `*_MAX_TOOL_TIMEOUT_MS` | per-call tool timeout ceiling (default 540s) |
+| `*_PERSISTENT_JOB_MAX_RUNTIME_MS` | default persistent-job max runtime (1h) |
 
 ## License
 
