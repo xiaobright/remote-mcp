@@ -3,12 +3,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { errorResponse } from "@remote-mcp/shared/mcp";
+import { commandOutputResponse, outputResponse } from "@remote-mcp/shared/output";
+import { registerHelpTool, toolFeatures } from "@remote-mcp/shared/tool-surface";
 import { registerRemoteFileTools, registerUnifiedRemoteFileTools } from "@remote-mcp/shared/remote";
 import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, runWslRawScript, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, startPersistentJob, getPersistentJobStatus, readPersistentJobOutput, waitPersistentJob, cancelPersistentJob, listPersistentJobs, } from "./wsl.js";
 const server = new McpServer({
     name: "wsl-mcp-server",
     version: "1.0.0",
 });
+const features = toolFeatures();
+registerHelpTool(server, "wsl", features);
 function formatDistro(distro) {
     return distro ?? "(system default)";
 }
@@ -16,7 +20,7 @@ const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
 const distroField = z.string()
     .optional()
-    .describe('Optional one-shot distro override (e.g. "Ubuntu-22.04"). Does not change the process session default. Pass "default" for system default.');
+    .describe('One-call distro override; "default" selects the system default.');
 const fileToolOptions = {
     server,
     prefix: "wsl_file",
@@ -38,12 +42,11 @@ const fileToolOptions = {
         });
     },
 };
-// REMOTE_MCP_FILE_API=unified 时把 5 个 wsl_file_* 合并为 1 个 wsl_file（action 区分）
-if (process.env.REMOTE_MCP_FILE_API === "unified") {
-    registerUnifiedRemoteFileTools(fileToolOptions);
-}
-else {
-    registerRemoteFileTools(fileToolOptions);
+if (features.files) {
+    if (features.fileApi === "unified")
+        registerUnifiedRemoteFileTools(fileToolOptions);
+    else
+        registerRemoteFileTools(fileToolOptions);
 }
 function formatCommandResult(result) {
     return [
@@ -67,14 +70,13 @@ function formatTaskOutput(output) {
         output.stderr ? `\nSTDERR:\n${output.stderr}` : "",
         output.timeoutClamped && requestedTimeoutMs && effectiveMs ? `\nRequested timeout ${requestedTimeoutMs} ms was capped at ${effectiveMs} ms so the MCP client has time to receive the result before its outer tool-call timeout.` : "",
         output.waitClamped && requestedWaitMs && effectiveMs ? `\nRequested wait ${requestedWaitMs} ms was capped at ${effectiveMs} ms so the MCP client has time to receive the result before its outer tool-call timeout.` : "",
-        output.readMode === "full" ? "" : "\nRead mode: delta (bounded window). Use read_mode=\"full\" with offsets to page through retained output, or continue with the returned offsets.",
-        `\nTask ${output.task.taskId}: ${output.task.state}`,
+        `\nTask ${output.task.taskId}: ${output.task.state}${output.task.exitCode !== null ? ` (exit ${output.task.exitCode})` : ""}`,
         `\nNext offsets: stdout=${output.nextStdoutOffset}, stderr=${output.nextStderrOffset}`,
         poll?.throttled ? `\nPolling was throttled inside the MCP server; waited ${poll.waitedMs} ms before returning.` : "",
     ].filter(Boolean).join("");
 }
 function formatPersistentJobStarted(job) {
-    return `Started persistent job ${job.jobId} (backend=${job.backend}, state=${job.state}). Logs at ${job.jobDir}. Use wsl_job action="status" to check progress.`;
+    return `Job ${job.jobId}: ${job.state}. Logs: ${job.jobDir}. Continue: wsl_job action="wait", jobId="${job.jobId}", wait_ms=60000.`;
 }
 function formatPersistentJobStatus(job) {
     return `Job ${job.jobId}: ${job.state}${job.exitCode !== null ? ` (exit ${job.exitCode})` : ""}. Started ${job.startedAt}.${job.endedAt ? ` Ended ${job.endedAt}.` : ""}`;
@@ -83,11 +85,9 @@ function formatPersistentJobOutput(output) {
     return [
         output.stdout,
         output.stderr ? `\nSTDERR:\n${output.stderr}` : "",
-        output.readMode === "full" ? "" : "\nRead mode: delta (bounded window). Use read_mode=\"full\" with offsets to page through the disk log, or continue with the returned offsets.",
         `\nJob ${output.job.jobId}: ${output.job.state}${output.job.exitCode !== null ? ` (exit ${output.job.exitCode})` : ""}`,
         `\nNext offsets: stdout=${output.nextStdoutOffset}/${output.stdoutLength}, stderr=${output.nextStderrOffset}/${output.stderrLength}`,
         output.completed !== undefined ? `\nCompleted: ${output.completed}${output.timedOut ? " (timed out)" : ""}${output.waitedMs !== undefined ? ` after ${output.waitedMs} ms` : ""}` : "",
-        "\nPersistent job: detached, logs on disk, survives MCP restart.",
     ].filter(Boolean).join("");
 }
 async function handleSessionAction(params) {
@@ -193,10 +193,7 @@ async function handleTaskAction(params) {
                 throw new Error("taskId is required for output");
             }
             const output = await observeTaskOutput(params.taskId, params.stdoutOffset, params.stderrOffset, params.tailChars, params.readMode);
-            return {
-                content: [{ type: "text", text: formatTaskOutput(output) }],
-                structuredContent: output,
-            };
+            return outputResponse(formatTaskOutput(output), output);
         }
         case "wait": {
             if (!params.taskId) {
@@ -208,10 +205,7 @@ async function handleTaskAction(params) {
                 tailChars: params.tailChars,
                 readMode: params.readMode,
             });
-            return {
-                content: [{ type: "text", text: formatTaskOutput(output) }],
-                structuredContent: output,
-            };
+            return outputResponse(formatTaskOutput(output), output);
         }
         case "cancel": {
             if (!params.taskId) {
@@ -265,25 +259,19 @@ async function handleJobAction(params) {
                 tailChars: params.tailChars,
                 readMode: params.readMode,
             });
-            return {
-                content: [{ type: "text", text: formatPersistentJobOutput(output) }],
-                structuredContent: output,
-            };
+            return outputResponse(formatPersistentJobOutput(output), output);
         }
         case "wait": {
             if (!params.jobId) {
                 throw new Error("jobId is required for wait");
             }
-            const output = await waitPersistentJob(params.jobId, params.waitMs ?? 30000, {
+            const output = await waitPersistentJob(params.jobId, params.waitMs ?? 60000, {
                 stdoutOffset: params.stdoutOffset,
                 stderrOffset: params.stderrOffset,
                 tailChars: params.tailChars,
                 readMode: params.readMode,
             });
-            return {
-                content: [{ type: "text", text: formatPersistentJobOutput(output) }],
-                structuredContent: output,
-            };
+            return outputResponse(formatPersistentJobOutput(output), output);
         }
         case "cancel": {
             if (!params.jobId) {
@@ -323,10 +311,10 @@ async function runCommandTool(params) {
             tailChars: params.tail_chars,
             readMode: params.read_mode,
         }, distro);
-        return { content: [{ type: "text", text: formatTaskOutput(output) }], structuredContent: output };
+        return outputResponse(formatTaskOutput(output), output);
     }
     const result = await execWsl(params.command, params.workdir, { timeoutMs: params.timeout_ms, distro });
-    return { content: [{ type: "text", text: formatCommandResult(result) }], structuredContent: result };
+    return commandOutputResponse(result, formatCommandResult);
 }
 async function runScriptTool(params) {
     const shell = params.shell ?? "bash";
@@ -341,10 +329,10 @@ async function runScriptTool(params) {
             tailChars: params.tail_chars,
             readMode: params.read_mode,
         }, distro);
-        return { content: [{ type: "text", text: formatTaskOutput(output) }], structuredContent: output };
+        return outputResponse(formatTaskOutput(output), output);
     }
     const result = await execWslScript(params.script, shell, params.workdir, { timeoutMs: params.timeout_ms, distro });
-    return { content: [{ type: "text", text: formatCommandResult(result) }], structuredContent: result };
+    return commandOutputResponse(result, formatCommandResult);
 }
 // Tool invocations go only through registerTool callbacks so MCP SDK Zod
 // validation runs. Do not override CallToolRequestSchema on server.server.
@@ -370,37 +358,33 @@ async function resolveRequestedDistro(input) {
     await ensureInstalledDistro(trimmed);
     return trimmed;
 }
-server.registerTool("wsl_session", {
-    title: "Manage WSL Session",
-    description: `Manage this MCP process's WSL session state (keepalive + configured distro).
-Actions: status, start, stop, set_distro, list_distros. Session state is owned by this MCP process.
-Workflow details: read the remote-execution skill.`,
-    inputSchema: z.object({
-        action: z.enum(["status", "start", "stop", "set_distro", "list_distros"]),
-        distro: z.string()
-            .optional()
-            .describe('Distro for start or set_distro, e.g. "Ubuntu-22.04"; pass "default" for system default.'),
-    }).strict(),
-    annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: true,
-    },
-}, async (params) => {
-    try {
-        return await handleSessionAction(params);
-    }
-    catch (error) {
-        return errorResponse(error);
-    }
-});
+if (features.admin)
+    server.registerTool("wsl_session", {
+        title: "Manage WSL Session",
+        description: `Manage process-local distro/keepalive state. Execution auto-starts it; stop does not shut down the distro. Details: wsl_help topic="connection".`,
+        inputSchema: z.object({
+            action: z.enum(["status", "start", "stop", "set_distro", "list_distros"]),
+            distro: z.string()
+                .optional()
+                .describe('Distro for start or set_distro, e.g. "Ubuntu-22.04"; pass "default" for system default.'),
+        }).strict(),
+        annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: true,
+        },
+    }, async (params) => {
+        try {
+            return await handleSessionAction(params);
+        }
+        catch (error) {
+            return errorResponse(error);
+        }
+    });
 server.registerTool("wsl_task", {
     title: "Manage WSL Async Task",
-    description: `Manage async/watch WSL tasks started by wsl_exec/wsl_script with mode="async"/"watch" (on_timeout="detach").
-Actions: status, output, wait, cancel, list. taskId required for status/output/wait/cancel; wait uses wait_ms; output uses stdoutOffset/stderrOffset/tail_chars/read_mode.
-Use action="wait" for builds/tests. status/output are throttled server-side: querying too soon blocks to the minimum poll interval.
-task dies when this MCP process exits; use wsl_job for work that must survive MCP restart.`,
+    description: `Wait/read/cancel attached exec/script tasks. Lost on MCP restart; persistent work uses wsl_job. Prefer wait (default 60s); reuse offsets for capped output. Details: wsl_help topic="output".`,
     inputSchema: z.object({
         action: z.enum(["status", "output", "wait", "cancel", "list"]),
         taskId: z.string()
@@ -410,25 +394,25 @@ task dies when this MCP process exits; use wsl_job for work that must survive MC
             .int()
             .positive()
             .optional()
-            .describe("For action=wait, maximum time to block before returning current output."),
+            .describe("Wait budget in ms; default 60000, returns early on completion."),
         stdoutOffset: z.number()
             .int()
             .nonnegative()
             .optional()
-            .describe("Read stdout starting at this character offset."),
+            .describe("stdout character offset from the previous result."),
         stderrOffset: z.number()
             .int()
             .nonnegative()
             .optional()
-            .describe("Read stderr starting at this character offset."),
+            .describe("stderr character offset from the previous result."),
         read_mode: z.enum(["delta", "full"])
             .optional()
-            .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
+            .describe('No offset: tail (delta) or first page (full).'),
         tail_chars: z.number()
             .int()
             .positive()
             .optional()
-            .describe("If set, ignore offsets and read only the last N characters from each stream."),
+            .describe("Capped tail window; overrides offsets."),
     }).strict(),
     annotations: {
         readOnlyHint: false,
@@ -451,20 +435,16 @@ task dies when this MCP process exits; use wsl_job for work that must survive MC
 });
 server.registerTool("wsl_exec", {
     title: "Run WSL Command",
-    description: `Execute a shell command inside this MCP process's WSL session. Avoids wsl.exe quoting traps for pipes, redirection, $(), and nested quotes.
-Each call uses a fresh shell; keepalive keeps the distro warm (auto-start on demand). Deletes under /mnt are blocked on purpose: delete Windows paths on the host, not through WSL.
-Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. Complex multi-line commands: use wsl_script.
-For reading or editing files inside WSL, prefer the wsl_file_* tools (encoding-safe, no quoting pitfalls, atomic guarded writes).`,
+    description: `Run a command in a fresh WSL shell. sync waits; async/watch return taskId for wsl_task. Sync timeout stops the local child; use wsl_job for persistence. Multi-line: wsl_script. Delete Windows-mounted paths on the host.`,
     inputSchema: z.object({
         command: z.string()
             .min(1, "command is required")
-            .describe("Shell command to execute inside WSL"),
+            .describe("Shell command."),
         workdir: z.string()
             .optional()
-            .describe("Working directory inside WSL (e.g., /home/user)"),
+            .describe("Working directory; failed cd aborts execution."),
         mode: runModeSchema
-            .default("sync")
-            .describe('Execution mode: "sync", "async", or "watch".'),
+            .default("sync"),
         timeout_ms: z.number()
             .int()
             .positive()
@@ -475,12 +455,12 @@ For reading or editing files inside WSL, prefer the wsl_file_* tools (encoding-s
             .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
         read_mode: z.enum(["delta", "full"])
             .optional()
-            .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
+            .describe('No offset: tail (delta) or first page (full).'),
         tail_chars: z.number()
             .int()
             .positive()
             .optional()
-            .describe("For watch mode, return only the last N characters from each stream."),
+            .describe("watch only: capped tail window."),
         distro: distroField,
     }).strict(),
     annotations: {
@@ -499,22 +479,19 @@ For reading or editing files inside WSL, prefer the wsl_file_* tools (encoding-s
 });
 server.registerTool("wsl_script", {
     title: "Run WSL Script",
-    description: `Execute a multi-line shell script inside this MCP process's WSL session. Script passes via stdin (bash -l -s), so quoting/heredocs are never interpreted by Windows.
-Deletes under /mnt are blocked on purpose: delete Windows paths on the host, not through WSL.
-Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. Parameter names match wsl_exec.`,
+    description: `Run a multi-line script/heredoc via stdin in a fresh WSL shell. sync waits; async/watch use wsl_task. Sync timeout stops the local child; durable work uses wsl_job. Delete Windows-mounted paths on the host.`,
     inputSchema: z.object({
         script: z.string()
             .min(1, "script is required")
-            .describe("Multi-line script content to execute"),
+            .describe("Multi-line shell script."),
         shell: z.string()
             .default("bash")
-            .describe("Shell to use (bash, sh, zsh, dash, etc.)"),
+            .describe("Shell executable."),
         workdir: z.string()
             .optional()
-            .describe("Working directory inside WSL"),
+            .describe("Working directory; failed cd aborts execution."),
         mode: runModeSchema
-            .default("sync")
-            .describe('Execution mode: "sync", "async", or "watch".'),
+            .default("sync"),
         timeout_ms: z.number()
             .int()
             .positive()
@@ -525,12 +502,12 @@ Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. P
             .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
         read_mode: z.enum(["delta", "full"])
             .optional()
-            .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
+            .describe('No offset: tail (delta) or first page (full).'),
         tail_chars: z.number()
             .int()
             .positive()
             .optional()
-            .describe("For watch mode, return only the last N characters from each stream."),
+            .describe("watch only: capped tail window."),
         distro: distroField,
     }).strict(),
     annotations: {
@@ -549,48 +526,47 @@ Prefer sync for ordinary work; mode="async"/"watch" + wsl_task for background. P
 });
 server.registerTool("wsl_job", {
     title: "Manage WSL Persistent Job",
-    description: `Manage detached persistent WSL jobs that survive MCP restart: runs fully detached inside WSL (setsid), logs in ~/.remote-mcp/jobs/<jobId>/.
-Actions: start, status, output, wait, cancel, list. read_mode default "delta" (bounded tail); use "full" with offsets to page logs. Workflow details: read the remote-execution skill.`,
+    description: `Run/manage detached bash jobs with disk logs. Survives MCP restart, not WSL shutdown. Prefer wait over polling. Default runtime limit: 1h. Details: wsl_help topic="jobs".`,
     inputSchema: z.object({
         action: z.enum(["start", "status", "output", "wait", "cancel", "list"]),
         command: z.string()
             .optional()
-            .describe("Shell command for action=start. Runs detached via setsid."),
+            .describe("start: shell command or multi-line bash script."),
         jobId: z.string()
             .optional()
             .describe("Job UUID for status/output/wait/cancel."),
         workdir: z.string()
             .optional()
-            .describe("Working directory inside WSL for action=start."),
+            .describe("Working directory; failed cd aborts execution. for action=start."),
         distro: distroField,
         max_runtime_ms: z.number()
             .int()
             .positive()
             .optional()
-            .describe("Auto-expire deadline for action=start. Default 3600000 (1h)."),
+            .describe("start: runtime limit in ms; default 3600000 (1h)."),
         wait_ms: z.number()
             .int()
             .positive()
             .optional()
-            .describe("Max poll duration for action=wait. Default 30000."),
+            .describe("Wait budget in ms; default 60000, returns early on completion."),
         stdoutOffset: z.number()
             .int()
             .nonnegative()
             .optional()
-            .describe("Read stdout starting at this byte offset."),
+            .describe("stdout byte offset from the previous result."),
         stderrOffset: z.number()
             .int()
             .nonnegative()
             .optional()
-            .describe("Read stderr starting at this byte offset."),
+            .describe("stderr byte offset from the previous result."),
         read_mode: z.enum(["delta", "full"])
             .optional()
-            .describe('"delta" (default) returns a bounded tail window; "full" reads one capped page from the requested offset.'),
+            .describe('No offset: tail (delta) or first page (full).'),
         tail_chars: z.number()
             .int()
             .positive()
             .optional()
-            .describe("If set, ignore offsets and read only the last N characters from each stream."),
+            .describe("Capped tail window; overrides offsets."),
     }).strict(),
     annotations: {
         readOnlyHint: false,

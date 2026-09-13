@@ -27,6 +27,8 @@ export interface TaskOutput<TMeta extends object> {
     nextStderrOffset: number;
     stdoutTruncated: boolean;
     stderrTruncated: boolean;
+    stdoutHasMore: boolean;
+    stderrHasMore: boolean;
     readMode: TaskReadMode;
     [key: string]: unknown;
 }
@@ -75,6 +77,7 @@ export declare class ProcessTaskManager<TMeta extends object> {
     cancel(taskId: string): TaskSnapshot<TMeta>;
     cancelAllSync(): void;
     private appendTaskOutput;
+    private appendTaskText;
     private snapshot;
     private pruneFinishedTasks;
     private getTask;

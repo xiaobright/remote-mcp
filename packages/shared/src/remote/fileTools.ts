@@ -595,7 +595,7 @@ export function registerRemoteFileTools(options: RegisterRemoteFileToolsOptions)
     {
       title: `${options.titlePrefix} Read File`,
       description: `Read a remote text file and return its full text. ${options.targetDescription}
-Prefer over cat: encoding auto-detected (UTF-8/GBK/UTF-16), size-capped, binary-safe. The returned sha256 doubles as expected_sha256 for write/edit. Workflow details: read the remote-execution skill.`,
+Encoding auto-detected; returned sha256 can guard write/edit. Legacy opt-in capability; see ${options.prefix.split("_")[0]}_help topic="files" for limitations.`,
       inputSchema: z.object({
         ...common,
         path: pathField,
@@ -771,7 +771,7 @@ function unifiedSchema(options: RegisterRemoteFileToolsOptions) {
   return z.object({
     action: unifiedActionEnum,
     ...common,
-    path: pathField,
+    path: pathField.optional(),
     content: z.string().optional().describe("Text content (write)."),
     create_parents: z.boolean().optional().describe("Create parent directories (write)."),
     overwrite: z.boolean().optional().describe("Allow overwrite (write)."),
@@ -803,9 +803,8 @@ export function registerUnifiedRemoteFileTools(options: RegisterRemoteFileToolsO
       return errorResponse(new Error(`Unknown ${toolName} action: ${action}`));
     }
     try {
-      // In unified mode the tool name reported to handlers should be the
-      // action tool name so existing messages stay consistent.
-      return await impl(params, { ...options, prefix: `${options.prefix}_${action}` });
+      const { action: _action, ...actionParams } = params;
+      return await impl(actionParams, options);
     } catch (error) {
       return errorResponse(error);
     }
@@ -815,7 +814,7 @@ export function registerUnifiedRemoteFileTools(options: RegisterRemoteFileToolsO
     {
       title: `${options.titlePrefix} File Operations (unified)`,
       description: `Remote file operations. ${options.targetDescription}
-Prefer over sed/cat/heredoc one-liners: encoding-safe, quoting-free, atomic writes, loud failures. Workflow details: read the remote-execution skill.
+Legacy opt-in capability. See ${options.prefix.split("_")[0]}_help topic="files" for limitations.
 action selects the operation:
   read(path, max_bytes?, encoding?) - read text file; full text in the text content
   write(path, content, create_parents?, overwrite?, expected_sha256?, mode?, encoding?) - write/create text file

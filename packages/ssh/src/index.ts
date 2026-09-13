@@ -4,6 +4,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { errorResponse } from "@remote-mcp/shared/mcp";
+import { commandOutputResponse, outputResponse } from "@remote-mcp/shared/output";
+import { registerHelpTool, toolFeatures } from "@remote-mcp/shared/tool-surface";
 import {
   registerRemoteFileTools,
   registerUnifiedRemoteFileTools,
@@ -44,6 +46,8 @@ const server = new McpServer({
   name: "ssh-mcp-server",
   version: "1.0.0",
 });
+const features = toolFeatures();
+registerHelpTool(server, "ssh", features);
 
 const runModeSchema = z.enum(["sync", "async", "watch"]);
 const timeoutBehaviorSchema = z.enum(["kill", "detach"]);
@@ -56,7 +60,7 @@ const fileToolOptions: RegisterRemoteFileToolsOptions = {
   targetFields: {
     target: z.string()
       .optional()
-      .describe("SSH target or saved device name. Omit to use SSH_MCP_DEFAULT_TARGET or ssh_profile set_default."),
+      .describe("SSH target/device; defaults to the configured target."),
     ssh_options: z.array(z.string())
       .optional()
       .describe('Extra ssh argv items, e.g. ["-p","2222","-i","C:/path/key"].'),
@@ -78,11 +82,9 @@ const fileToolOptions: RegisterRemoteFileToolsOptions = {
   }),
 };
 
-// REMOTE_MCP_FILE_API=unified 时把 5 个 ssh_file_* 合并为 1 个 ssh_file（action 区分）
-if (process.env.REMOTE_MCP_FILE_API === "unified") {
-  registerUnifiedRemoteFileTools(fileToolOptions);
-} else {
-  registerRemoteFileTools(fileToolOptions);
+if (features.files) {
+  if (features.fileApi === "unified") registerUnifiedRemoteFileTools(fileToolOptions);
+  else registerRemoteFileTools(fileToolOptions);
 }
 
 function formatCommandResult(result: {
@@ -128,7 +130,6 @@ function formatTaskOutput(output: {
     output.stderr ? `\nSTDERR:\n${output.stderr}` : "",
     output.timeoutClamped && requestedTimeoutMs && effectiveMs ? `\nRequested timeout ${requestedTimeoutMs} ms was capped at ${effectiveMs} ms so the MCP client can receive the result before its outer tool-call timeout.` : "",
     output.waitClamped && requestedWaitMs && effectiveMs ? `\nRequested wait ${requestedWaitMs} ms was capped at ${effectiveMs} ms so the MCP client can receive the result before its outer tool-call timeout.` : "",
-    output.readMode === "full" ? "" : "\nRead mode: delta (bounded window). Use read_mode=\"full\" with offsets to page through retained output, or continue with the returned offsets.",
     `\nTask ${output.task.taskId}: ${output.task.state}${output.task.exitCode !== null ? ` (exit ${output.task.exitCode})` : ""}`,
     `\nNext offsets: stdout=${output.nextStdoutOffset}, stderr=${output.nextStderrOffset}`,
     poll?.throttled ? `\nPolling was throttled inside the MCP server; waited ${poll.waitedMs} ms before returning.` : "",
@@ -136,7 +137,7 @@ function formatTaskOutput(output: {
 }
 
 function formatPersistentJobStarted(job: { jobId: string; backend: string; state: string; jobDir: string; target?: string }): string {
-  return `Started persistent job ${job.jobId} (backend=${job.backend}, state=${job.state}, target=${job.target ?? "N/A"}). Logs at ${job.jobDir}. Use ssh_job action="status" to check progress.`;
+  return `Job ${job.jobId}: ${job.state} on ${job.target ?? "N/A"}. Logs: ${job.jobDir}. Continue: ssh_job action="wait", jobId="${job.jobId}", wait_ms=60000.`;
 }
 
 function formatPersistentJobStatus(job: { jobId: string; state: string; exitCode: number | null; startedAt: string; endedAt: string | null; target?: string }): string {
@@ -159,11 +160,9 @@ function formatPersistentJobOutput(output: {
   return [
     output.stdout,
     output.stderr ? `\nSTDERR:\n${output.stderr}` : "",
-    output.readMode === "full" ? "" : "\nRead mode: delta (bounded window). Use read_mode=\"full\" with offsets to page through the disk log, or continue with the returned offsets.",
     `\nJob ${output.job.jobId}: ${output.job.state}${output.job.exitCode !== null ? ` (exit ${output.job.exitCode})` : ""} on ${output.job.target ?? "N/A"}`,
     `\nNext offsets: stdout=${output.nextStdoutOffset}/${output.stdoutLength}, stderr=${output.nextStderrOffset}/${output.stderrLength}`,
     output.completed !== undefined ? `\nCompleted: ${output.completed}${output.timedOut ? " (timed out)" : ""}${output.waitedMs !== undefined ? ` after ${output.waitedMs} ms` : ""}` : "",
-    "\nPersistent job: detached, logs on disk, survives MCP restart.",
   ].filter(Boolean).join("");
 }
 
@@ -215,10 +214,7 @@ async function handleProfileAction(params: {
     }
     case "test": {
       const result = await testSshTarget(params.target, params.timeout_ms);
-      return {
-        content: [{ type: "text" as const, text: formatCommandResult(result) }],
-        structuredContent: result,
-      };
+      return commandOutputResponse(result, formatCommandResult);
     }
     case "list_devices": {
       const devices = listDevices();
@@ -332,10 +328,7 @@ async function handleTaskAction(params: {
         params.tailChars,
         params.readMode,
       );
-      return {
-        content: [{ type: "text" as const, text: formatTaskOutput(output) }],
-        structuredContent: output,
-      };
+      return outputResponse(formatTaskOutput(output), output);
     }
     case "wait": {
       if (!params.taskId) {
@@ -347,10 +340,7 @@ async function handleTaskAction(params: {
         tailChars: params.tailChars,
         readMode: params.readMode,
       });
-      return {
-        content: [{ type: "text" as const, text: formatTaskOutput(output) }],
-        structuredContent: output,
-      };
+      return outputResponse(formatTaskOutput(output), output);
     }
     case "cancel": {
       if (!params.taskId) {
@@ -416,25 +406,19 @@ async function handleJobAction(params: {
         tailChars: params.tailChars,
         readMode: params.readMode,
       });
-      return {
-        content: [{ type: "text" as const, text: formatPersistentJobOutput(output) }],
-        structuredContent: output,
-      };
+      return outputResponse(formatPersistentJobOutput(output), output);
     }
     case "wait": {
       if (!params.jobId) {
         throw new Error("jobId is required for wait");
       }
-      const output = await waitPersistentJob(params.jobId, params.waitMs ?? 30000, {
+      const output = await waitPersistentJob(params.jobId, params.waitMs ?? 60000, {
         stdoutOffset: params.stdoutOffset,
         stderrOffset: params.stderrOffset,
         tailChars: params.tailChars,
         readMode: params.readMode,
       });
-      return {
-        content: [{ type: "text" as const, text: formatPersistentJobOutput(output) }],
-        structuredContent: output,
-      };
+      return outputResponse(formatPersistentJobOutput(output), output);
     }
     case "cancel": {
       if (!params.jobId) {
@@ -498,24 +482,21 @@ async function runScriptTool(params: {
       tailChars: params.tail_chars,
       readMode: params.read_mode,
     });
-    return { content: [{ type: "text" as const, text: formatTaskOutput(output) }], structuredContent: output };
+    return outputResponse(formatTaskOutput(output), output);
   }
 
   const result = await runSshScript(options);
-  return { content: [{ type: "text" as const, text: formatCommandResult(result) }], structuredContent: result };
+  return commandOutputResponse(result, formatCommandResult);
 }
 
 // Tool invocations go only through registerTool callbacks so MCP SDK Zod
 // validation runs. Do not override CallToolRequestSchema on server.server.
 
-server.registerTool(
+if (features.admin) server.registerTool(
   "ssh_profile",
   {
     title: "Manage SSH Target",
-    description: `Manage SSH target/profile state and a lightweight non-secret device registry.
-Each run starts a fresh ssh process (no persistent session; use OpenSSH ControlMaster if you need reuse).
-Actions: status, set_default, clear_default, test, list_devices, get_device, upsert_device, remove_device.
-Parameter and workflow details: read the remote-execution skill.`,
+    description: `Manage default SSH target and non-secret device profiles. Ordinary execution needs no profile call. Details: ssh_help topic="connection".`,
     inputSchema: z.object({
       action: z.enum(["status", "set_default", "clear_default", "test", "list_devices", "get_device", "upsert_device", "remove_device"]),
       name: z.string()
@@ -593,10 +574,7 @@ server.registerTool(
   "ssh_task",
   {
     title: "Manage SSH Async Task",
-    description: `Manage async/watch SSH tasks started by ssh_exec/ssh_script with mode="async"/"watch" (on_timeout="detach").
-Actions: status, output, wait, cancel, list. taskId required for status/output/wait/cancel; wait uses wait_ms; output uses stdoutOffset/stderrOffset/tail_chars/read_mode.
-Use action="wait" for builds/tests. status/output are throttled server-side: querying too soon blocks to the minimum poll interval.
-task dies when this MCP process exits; use ssh_job for work that must survive MCP restart.`,
+    description: `Wait/read/cancel attached exec/script tasks. Lost on MCP restart; persistent work uses ssh_job. Prefer wait (default 60s); reuse offsets for capped output. Details: ssh_help topic="output".`,
     inputSchema: z.object({
       action: z.enum(["status", "output", "wait", "cancel", "list"]),
       taskId: z.string()
@@ -606,25 +584,25 @@ task dies when this MCP process exits; use ssh_job for work that must survive MC
         .int()
         .positive()
         .optional()
-        .describe("For action=wait, maximum time to block before returning current output."),
+        .describe("Wait budget in ms; default 60000, returns early on completion."),
       stdoutOffset: z.number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Read stdout starting at this character offset."),
+        .describe("stdout character offset from the previous result."),
       stderrOffset: z.number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Read stderr starting at this character offset."),
+        .describe("stderr character offset from the previous result."),
       read_mode: z.enum(["delta", "full"])
         .optional()
-        .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
+        .describe('No offset: tail (delta) or first page (full).'),
       tail_chars: z.number()
         .int()
         .positive()
         .optional()
-        .describe("If set, ignore offsets and read only the last N characters from each stream."),
+        .describe("Capped tail window; overrides offsets."),
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -659,34 +637,31 @@ server.registerTool(
   "ssh_exec",
   {
     title: "Run SSH Command",
-    description: `Execute a shell command on a remote SSH target. Command is sent via stdin to the remote shell, avoiding Windows quoting issues (pipes, $(), heredocs, nested quotes).
-Each call starts a fresh ssh process. Prefer sync for ordinary commands and long builds/tests; mode="async"/"watch" + ssh_task for background work. For complex multi-line commands use ssh_script.
-For reading or editing files on the target, prefer the ssh_file_* tools (encoding-safe, no quoting pitfalls, atomic guarded writes).`,
+    description: `Run a command via stdin in a fresh SSH shell. sync waits; async/watch return taskId for ssh_task. Sync timeout stops the local child, not necessarily remote descendants. Multi-line: ssh_script; persistent work: ssh_job.`,
     inputSchema: z.object({
       command: z.string()
         .min(1, "command is required")
-        .describe("Shell command to execute on the remote target."),
+        .describe("Shell command."),
       target: z.string()
         .optional()
-        .describe("SSH target or saved device name. Omit to use SSH_MCP_DEFAULT_TARGET or ssh_profile set_default."),
+        .describe("SSH target/device; defaults to the configured target."),
       shell: z.string()
         .default("bash")
-        .describe("Remote shell to run. Default: bash."),
+        .describe("Remote shell."),
       login: z.boolean()
         .default(true)
         .describe("Use login shell mode for bash/zsh."),
       workdir: z.string()
         .optional()
-        .describe("Remote working directory."),
+        .describe("Working directory; failed cd aborts execution."),
       env: z.record(z.string())
         .optional()
-        .describe("Environment variables exported before running the command."),
+        .describe("Environment for this call."),
       ssh_options: z.array(z.string())
         .optional()
         .describe('Extra ssh argv items, e.g. ["-p","2222","-i","C:/path/key"].'),
       mode: runModeSchema
-        .default("sync")
-        .describe('Execution mode: "sync", "async", or "watch".'),
+        .default("sync"),
       timeout_ms: z.number()
         .int()
         .positive()
@@ -697,12 +672,12 @@ For reading or editing files on the target, prefer the ssh_file_* tools (encodin
         .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
       read_mode: z.enum(["delta", "full"])
         .optional()
-        .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
+        .describe('No offset: tail (delta) or first page (full).'),
       tail_chars: z.number()
         .int()
         .positive()
         .optional()
-        .describe("For watch mode, return only the last N characters from each stream."),
+        .describe("watch only: capped tail window."),
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -740,34 +715,31 @@ server.registerTool(
   "ssh_script",
   {
     title: "Run SSH Script",
-    description: `Execute a multi-line shell script on a remote SSH target. Script is passed via stdin to the remote shell; prefer this over ssh_exec for pipes, $(), loops, heredocs, and quoting.
-No persistent session: one ssh child process per call. Prefer sync for ordinary work; mode="async"/"watch" + ssh_task for background. Parameter names match wsl_script.
-For reading or editing files on the target, prefer the ssh_file_* tools (encoding-safe, no quoting pitfalls, atomic guarded writes).`,
+    description: `Run a multi-line script/heredoc via stdin in a fresh SSH shell. sync waits; async/watch use ssh_task. Sync timeout stops the local child, not necessarily remote descendants. Durable work: ssh_job.`,
     inputSchema: z.object({
       script: z.string()
         .min(1, "script is required")
-        .describe("Multi-line script content to execute on the remote target."),
+        .describe("Multi-line shell script."),
       target: z.string()
         .optional()
-        .describe("SSH target or saved device name. Omit to use SSH_MCP_DEFAULT_TARGET or ssh_profile set_default."),
+        .describe("SSH target/device; defaults to the configured target."),
       shell: z.string()
         .default("bash")
-        .describe("Remote shell to run. Default: bash."),
+        .describe("Remote shell."),
       login: z.boolean()
         .default(true)
         .describe("Use login shell mode for bash/zsh."),
       workdir: z.string()
         .optional()
-        .describe("Remote working directory."),
+        .describe("Working directory; failed cd aborts execution."),
       env: z.record(z.string())
         .optional()
-        .describe("Environment variables exported before running the script."),
+        .describe("Environment for this call."),
       ssh_options: z.array(z.string())
         .optional()
         .describe('Extra ssh argv items, e.g. ["-p","2222","-i","C:/path/key"].'),
       mode: runModeSchema
-        .default("sync")
-        .describe('Execution mode: "sync", "async", or "watch".'),
+        .default("sync"),
       timeout_ms: z.number()
         .int()
         .positive()
@@ -778,12 +750,12 @@ For reading or editing files on the target, prefer the ssh_file_* tools (encodin
         .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
       read_mode: z.enum(["delta", "full"])
         .optional()
-        .describe('Read mode: "delta" returns a bounded recent window by default; "full" pages from the requested offset.'),
+        .describe('No offset: tail (delta) or first page (full).'),
       tail_chars: z.number()
         .int()
         .positive()
         .optional()
-        .describe("For watch mode, return only the last N characters from each stream."),
+        .describe("watch only: capped tail window."),
     }).strict(),
     annotations: {
       readOnlyHint: false,
@@ -818,50 +790,49 @@ server.registerTool(
   "ssh_job",
   {
     title: "Manage SSH Persistent Job",
-    description: `Manage detached persistent SSH jobs that survive MCP restart: runs detached on the remote host (setsid), logs in ~/.remote-mcp/jobs/<jobId>/ on the remote host.
-Actions: start, status, output, wait, cancel, list. read_mode default "delta" (bounded tail); use "full" with offsets to page logs. Workflow details: read the remote-execution skill.`,
+    description: `Run/manage detached bash jobs with disk logs. Survives MCP restart, not host reboot. Prefer wait over polling. Default runtime limit: 1h. Details: ssh_help topic="jobs".`,
     inputSchema: z.object({
       action: z.enum(["start", "status", "output", "wait", "cancel", "list"]),
       command: z.string()
         .optional()
-        .describe("Shell command for action=start. Runs detached via setsid on the remote host."),
+        .describe("start: shell command or multi-line bash script."),
       jobId: z.string()
         .optional()
         .describe("Job UUID for status/output/wait/cancel."),
       target: z.string()
         .optional()
-        .describe("SSH target or saved device name for action=start. Omit to use SSH_MCP_DEFAULT_TARGET."),
+        .describe("start: SSH target/device; defaults to configured target."),
       workdir: z.string()
         .optional()
-        .describe("Remote working directory for action=start."),
+        .describe("start: working directory."),
       max_runtime_ms: z.number()
         .int()
         .positive()
         .optional()
-        .describe("Auto-expire deadline for action=start. Default 3600000 (1h)."),
+        .describe("start: runtime limit in ms; default 3600000 (1h)."),
       wait_ms: z.number()
         .int()
         .positive()
         .optional()
-        .describe("Max poll duration for action=wait. Default 30000."),
+        .describe("Wait budget in ms; default 60000, returns early on completion."),
       stdoutOffset: z.number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Read stdout starting at this byte offset."),
+        .describe("stdout byte offset from the previous result."),
       stderrOffset: z.number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Read stderr starting at this byte offset."),
+        .describe("stderr byte offset from the previous result."),
       read_mode: z.enum(["delta", "full"])
         .optional()
-        .describe('"delta" (default) returns a bounded tail window; "full" reads one capped page from the requested offset.'),
+        .describe('No offset: tail (delta) or first page (full).'),
       tail_chars: z.number()
         .int()
         .positive()
         .optional()
-        .describe("If set, ignore offsets and read only the last N characters from each stream."),
+        .describe("Capped tail window; overrides offsets."),
     }).strict(),
     annotations: {
       readOnlyHint: false,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildPersistentJobCancelScript, buildPersistentJobRunnerScript, inferPersistentJobState, parsePersistentJobInspect, } from "./persistentJobs.js";
+import { buildPersistentJobCancelScript, buildPersistentJobInspectScript, buildPersistentJobRunnerScript, decodeJobPage, inferPersistentJobState, parsePersistentJobInspect, requireJobCommandSuccess, } from "./persistentJobs.js";
 describe("inferPersistentJobState", () => {
     it("maps status tokens", () => {
         assert.equal(inferPersistentJobState(""), "starting");
@@ -24,6 +24,38 @@ describe("buildPersistentJobRunnerScript", () => {
         assert.match(script, /printf "%s" "\$\$" > "\$job_dir\/pgid"/);
         assert.doesNotMatch(script, /printf "%s" "\$!" > "\$JOB_DIR\/pgid"/);
     });
+    it("fails closed for bad workdirs instead of falling back to HOME", () => {
+        const script = buildPersistentJobRunnerScript({ jobId: "test", commandB64: "", workdirB64: "", maxRuntimeMs: 1000 });
+        assert.match(script, /error: cannot enter workdir/);
+        assert.doesNotMatch(script, /\|\| cd "\$HOME"/);
+        assert.match(script, /command -v setsid/);
+    });
+});
+it("job inspect distinguishes explicit zero offsets from default tail reads", () => {
+    const explicit = buildPersistentJobInspectScript({
+        jobId: "test", readMode: "delta", stdoutOffset: 0, maxChars: 64, includeContent: true,
+    });
+    assert.match(explicit, /SOFF_SET=1/);
+    assert.match(explicit, /EOFF_SET=0/);
+    assert.match(explicit, /window=\$MAX/);
+});
+it("incomplete or failed job inspections do not fabricate starting/running state", () => {
+    assert.throws(() => parsePersistentJobInspect(""), /missing STATUS/);
+    assert.throws(() => requireJobCommandSuccess("inspect", { exitCode: 255, stderr: "connection failed" }), /connection failed/);
+    assert.throws(() => requireJobCommandSuccess("inspect", { exitCode: 0, stderr: "", timedOut: true }), /timed out/);
+});
+it("UTF-8 job pages retain resumable byte offsets", () => {
+    const bytes = Buffer.from("a🙂你b");
+    let offset = 0;
+    let text = "";
+    while (offset < bytes.length) {
+        const end = Math.min(bytes.length, offset + 4);
+        const page = decodeJobPage(bytes.subarray(offset, end).toString("base64"), offset, end, bytes.length, false);
+        assert.ok(page.nextOffset > offset);
+        text += page.text;
+        offset = page.nextOffset;
+    }
+    assert.equal(text, "a🙂你b");
 });
 describe("buildPersistentJobCancelScript", () => {
     it("prefers runner.pid and verifies liveness", () => {

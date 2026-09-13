@@ -33,6 +33,11 @@ export function validateShell(shell) {
     }
     return trimmed;
 }
+export function shellStdinArgs(shellInput = "bash", login = true) {
+    const shell = validateShell(shellInput);
+    const base = shell.split(/[\\/]/).pop();
+    return login && (base === "bash" || base === "zsh") ? [shell, "-l", "-s"] : [shell, "-s"];
+}
 export function validateEnvName(name) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
         throw new Error(`Unsafe environment variable name: ${name}`);
@@ -47,6 +52,6 @@ export function buildEnvPreamble(env) {
     return lines.length ? `${lines.join("\n")}\n` : "";
 }
 export function buildWorkdirPreamble(workdir) {
-    return workdir ? `cd -- ${shellQuote(workdir)}\n` : "";
+    return workdir ? `cd -- ${shellQuote(workdir)} || exit $?\n` : "";
 }
 //# sourceMappingURL=shell.js.map

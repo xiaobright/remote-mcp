@@ -5,4 +5,6 @@ export * from "./process.js";
 export * from "./persistentJobs.js";
 export * from "./shell.js";
 export * from "./taskManager.js";
+export * from "./toolSurface.js";
+export * from "./output.js";
 //# sourceMappingURL=index.d.ts.map

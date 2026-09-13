@@ -2,7 +2,7 @@
   "name": "remote-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Transport-focused MCP servers for SSH and WSL command execution plus agent-friendly remote file editing.",
+  "description": "Lean SSH/WSL execution and persistent-job MCP servers with on-demand help.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -17,7 +17,9 @@
   ],
   "scripts": {
     "build": "npm --workspace @remote-mcp/shared run build && npm --workspace @remote-mcp/ssh run build && npm --workspace @remote-mcp/wsl run build && npm --workspace @remote-mcp/imagegen run build",
-    "test": "npm run build && node --test packages/shared/dist/shell.test.js packages/shared/dist/persistentJobs.test.js packages/shared/dist/remote/edit.test.js packages/shared/dist/remote/patch.test.js packages/shared/dist/remote/diff.test.js scripts/tool-schema.test.mjs",
+    "test": "npm run build && node --test packages/shared/dist/shell.test.js packages/shared/dist/persistentJobs.test.js packages/shared/dist/taskManager.test.js packages/shared/dist/output.test.js packages/shared/dist/remote/edit.test.js packages/shared/dist/remote/patch.test.js packages/shared/dist/remote/diff.test.js packages/shared/dist/remote/fileTools.test.js scripts/tool-schema.test.mjs scripts/core-tools.test.mjs",
+    "test:wsl": "npm run build && node scripts/smoke-wsl.mjs",
+    "probe": "node scripts/probe-tools.mjs",
     "start:ssh": "npm --workspace @remote-mcp/ssh start",
     "start:wsl": "npm --workspace @remote-mcp/wsl start",
     "start:imagegen": "npm --workspace @remote-mcp/imagegen start"

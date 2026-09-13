@@ -7,17 +7,8 @@ tool call starts one local `ssh` process and sends the remote command/script to
 the remote shell through stdin. That is enough to avoid Windows/PowerShell
 escaping traps while keeping remote state predictable.
 
-## Tools
+## Default Tools
 
-- `ssh_profile`
-  - `status`: show current default target and options.
-  - `list_devices`: list saved device profiles.
-  - `get_device`: inspect one device profile.
-  - `upsert_device`: create or update a device profile.
-  - `remove_device`: remove a device profile.
-  - `set_default`: set a process-local default target.
-  - `clear_default`: clear the default target.
-  - `test`: run a small read-only probe.
 - `ssh_exec`
   - Run a short command. Internally it is still sent through stdin.
 - `ssh_script`
@@ -26,16 +17,15 @@ escaping traps while keeping remote state predictable.
     and anything more complex than one line.
 - `ssh_task`
   - Manage async/watch tasks started by `ssh_exec` or `ssh_script`.
-- `ssh_file_edit`
-  - Replace exact text in one remote file.
-  - Defaults to one unique match; pass `replace_all=true` to replace every match.
-  - Also accepts `oldString`/`newString`/`replaceAll` aliases for clients whose
-    native edit tool uses camelCase.
-- `ssh_file_apply_patch`
-  - Apply Codex-style multi-file patches and add files.
-  - Blank or unmarked hunk lines are treated as context and reported in
-    `structuredContent.normalizations`.
-  - Hunks with no additions or removals are rejected to catch missing markers.
+- `ssh_job`
+  - Detached jobs with remote disk logs; survive MCP restarts, not host reboot.
+- `ssh_help`
+  - Topic help: overview, execution, jobs, output, connection, files. No skill required.
+
+`REMOTE_MCP_ENABLE_ADMIN_TOOLS=1` optionally registers `ssh_profile`.
+`REMOTE_MCP_ENABLE_FILE_TOOLS=1` optionally registers legacy file tools.
+Both are disabled by default. See the [root README](../../README.en.md) for
+configuration, pagination, output compatibility and legacy limitations.
 
 ## Execution Parameters
 
@@ -60,13 +50,14 @@ Use `ssh_exec` / `ssh_script` with `mode="async"` for background work.
 Prefer `mode="sync"` for normal commands and long builds/tests when there is no
 other foreground work to do. Use `mode="async"` only when true background
 concurrency is useful. `ssh_task status/output` calls are throttled by default:
-if a running task is observed less than 20 seconds after the previous
+if a running task is observed less than 60 seconds after the previous
 observation, the MCP server waits until the minimum interval and returns a
 warning.
 
 ## Device Profiles
 
-Device profiles live in `devices.json` next to this server by default. They are
+Profile-management calls require the admin flag; using an existing device name
+does not. Device profiles live in `devices.json` next to this server by default. They are
 local, git-ignored, non-secret connection records. They may store:
 
 - friendly name
@@ -129,7 +120,8 @@ PowerShell equivalent of `ssh-copy-id`:
 Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh alice@devbox.local "umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys"
 ```
 
-After that, use:
+After that, use `ssh_exec command="true" target="devbox"` to verify.
+With admin tools explicitly enabled, this is also available:
 
 ```text
 ssh_profile action="test" target="rock5a"
@@ -160,14 +152,8 @@ SSH_MCP_STRICT_HOST_KEY_CHECKING = "accept-new"
 - `SSH_MCP_CONNECT_TIMEOUT_SEC`: default `10`.
 - `SSH_MCP_STRICT_HOST_KEY_CHECKING`: default `accept-new`.
 - `SSH_MCP_DEVICES_PATH`: override device profile store path. Default: `devices.json`.
-- `SSH_MCP_MIN_POLL_INTERVAL_MS`: default `20000`.
+- `SSH_MCP_MIN_POLL_INTERVAL_MS`: default `60000`.
+- `SSH_MCP_DEFAULT_TASK_WAIT_MS`: default `60000`.
 - `SSH_MCP_DEFAULT_SYNC_TIMEOUT_MS`: default `120000`.
 - `SSH_MCP_DEFAULT_WATCH_TIMEOUT_MS`: default `120000`.
 - `SSH_MCP_MAX_TOOL_TIMEOUT_MS`: default `540000`.
-
-## Good Next Features
-
-- `ssh_sync`: explicit rsync/scp wrapper with dry-run and exclude lists.
-- `ssh_key`: explicit public-key install helper, never automatic.
-- `ssh_tunnel`: managed local port forwards with task-style lifecycle.
-- `ssh_disk`: read-only disk usage snapshot and low-space warnings.

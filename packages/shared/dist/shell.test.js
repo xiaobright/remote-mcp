@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { dirnameScript, joinRemotePath, shellQuote, validateEnvName, validateShell } from "./shell.js";
+import { buildWorkdirPreamble, dirnameScript, joinRemotePath, shellQuote, shellStdinArgs, validateEnvName, validateShell } from "./shell.js";
 describe("shellQuote", () => {
     it("wraps simple values", () => {
         assert.equal(shellQuote("hello"), "'hello'");
@@ -8,6 +8,16 @@ describe("shellQuote", () => {
     it("escapes single quotes", () => {
         assert.equal(shellQuote("a'b"), `'a'\\''b'`);
     });
+});
+it("workdir failures abort before the user's command", () => {
+    assert.equal(buildWorkdirPreamble("/missing dir"), "cd -- '/missing dir' || exit $?\n");
+});
+it("login flags are only passed to shells supporting that contract", () => {
+    assert.deepEqual(shellStdinArgs("bash"), ["bash", "-l", "-s"]);
+    assert.deepEqual(shellStdinArgs("/bin/zsh"), ["/bin/zsh", "-l", "-s"]);
+    assert.deepEqual(shellStdinArgs("sh"), ["sh", "-s"]);
+    assert.deepEqual(shellStdinArgs("dash"), ["dash", "-s"]);
+    assert.deepEqual(shellStdinArgs("bash", false), ["bash", "-s"]);
 });
 describe("dirnameScript", () => {
     it("handles root-level paths by setting dir to /", () => {

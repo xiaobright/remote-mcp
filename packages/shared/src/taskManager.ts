@@ -1,6 +1,6 @@
 import { type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
+import { StringDecoder } from "node:string_decoder";
 import { killProcessTree } from "./process.js";
 
 export type TaskState = "running" | "exited" | "error" | "cancelled";
@@ -34,6 +34,8 @@ export interface TaskOutput<TMeta extends object> {
   nextStderrOffset: number;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+  stdoutHasMore: boolean;
+  stderrHasMore: boolean;
   readMode: TaskReadMode;
   [key: string]: unknown;
 }
@@ -73,6 +75,8 @@ interface ManagedTask<TMeta extends object> {
   error: string | null;
   stdout: string;
   stderr: string;
+  stdoutDecoder: StringDecoder;
+  stderrDecoder: StringDecoder;
   stdoutBaseOffset: number;
   stderrBaseOffset: number;
   finished: Promise<void>;
@@ -115,25 +119,33 @@ function sliceTaskStream(
   tailChars?: number,
   readMode: TaskReadMode = "delta",
   defaultReadWindowChars = 8192,
-): { text: string; offset: number; nextOffset: number; truncated: boolean } {
+): { text: string; offset: number; nextOffset: number; truncated: boolean; hasMore: boolean } {
   const totalLength = baseOffset + content.length;
+  const limit = Math.max(2, defaultReadWindowChars);
   let offset = baseOffset;
   if (typeof tailChars === "number") {
-    offset = Math.max(baseOffset, totalLength - tailChars);
+    offset = Math.max(baseOffset, totalLength - Math.min(tailChars, limit));
   } else if (typeof requestedOffset === "number") {
     offset = Math.max(baseOffset, requestedOffset);
   } else if (readMode === "full") {
     offset = baseOffset;
   } else {
-    offset = Math.max(baseOffset, totalLength - defaultReadWindowChars);
+    offset = Math.max(baseOffset, totalLength - limit);
   }
-  const start = offset - baseOffset;
+  offset = Math.min(offset, totalLength);
+  let start = offset - baseOffset;
+  if (start > 0 && /[\uDC00-\uDFFF]/.test(content[start])) start += 1;
+  offset = baseOffset + start;
+  let end = Math.min(content.length, start + limit);
+  if (end < content.length && /[\uD800-\uDBFF]/.test(content[end - 1])) end -= 1;
+  const nextOffset = baseOffset + end;
 
   return {
-    text: content.slice(start),
+    text: content.slice(start, end),
     offset,
-    nextOffset: totalLength,
-    truncated: baseOffset > 0 || offset > baseOffset,
+    nextOffset,
+    truncated: baseOffset > 0 || offset > baseOffset || nextOffset < totalLength,
+    hasMore: nextOffset < totalLength,
   };
 }
 
@@ -158,6 +170,8 @@ export class ProcessTaskManager<TMeta extends object> {
       error: null,
       stdout: "",
       stderr: "",
+      stdoutDecoder: new StringDecoder("utf8"),
+      stderrDecoder: new StringDecoder("utf8"),
       stdoutBaseOffset: 0,
       stderrBaseOffset: 0,
       finished: latch.finished,
@@ -172,7 +186,9 @@ export class ProcessTaskManager<TMeta extends object> {
     proc.stdout?.on("data", (data: Buffer) => this.appendTaskOutput(task, "stdout", data));
     proc.stderr?.on("data", (data: Buffer) => this.appendTaskOutput(task, "stderr", data));
     proc.on("close", (code, signal) => {
-      if (task.state !== "cancelled") {
+      this.appendTaskText(task, "stdout", task.stdoutDecoder.end());
+      this.appendTaskText(task, "stderr", task.stderrDecoder.end());
+      if (task.state === "running") {
         task.state = "exited";
       }
       task.exitCode = code ?? -1;
@@ -197,6 +213,8 @@ export class ProcessTaskManager<TMeta extends object> {
     });
 
     if (typeof options.input === "string") {
+      // A command may exit before it has consumed stdin; do not crash the MCP on EPIPE.
+      proc.stdin?.on("error", () => {});
       proc.stdin?.write(options.input);
       proc.stdin?.end();
     }
@@ -268,11 +286,16 @@ export class ProcessTaskManager<TMeta extends object> {
   }
 
   private appendTaskOutput(task: ManagedTask<TMeta>, stream: "stdout" | "stderr", data: Buffer): void {
-    const text = data.toString();
+    const decoder = stream === "stdout" ? task.stdoutDecoder : task.stderrDecoder;
+    this.appendTaskText(task, stream, decoder.write(data));
+  }
+
+  private appendTaskText(task: ManagedTask<TMeta>, stream: "stdout" | "stderr", text: string): void {
     const baseKey = stream === "stdout" ? "stdoutBaseOffset" : "stderrBaseOffset";
     task[stream] += text;
-    const overflow = task[stream].length - this.options.outputLimit;
+    let overflow = task[stream].length - this.options.outputLimit;
     if (overflow > 0) {
+      if (/[\uDC00-\uDFFF]/.test(task[stream][overflow])) overflow += 1;
       task[stream] = task[stream].slice(overflow);
       task[baseKey] += overflow;
     }
@@ -349,6 +372,8 @@ export class ProcessTaskManager<TMeta extends object> {
       nextStderrOffset: stderrSlice.nextOffset,
       stdoutTruncated: stdoutSlice.truncated,
       stderrTruncated: stderrSlice.truncated,
+      stdoutHasMore: stdoutSlice.hasMore,
+      stderrHasMore: stderrSlice.hasMore,
       readMode: options.readMode ?? "delta",
     };
   }
@@ -369,7 +394,7 @@ export class ProcessTaskManager<TMeta extends object> {
       const elapsed = task.lastObservationAt === null ? this.options.minPollIntervalMs : now - task.lastObservationAt;
       const waitMs = task.state === "running" ? Math.max(0, this.options.minPollIntervalMs - elapsed) : 0;
       if (waitMs > 0) {
-        await delay(waitMs);
+        await this.waitForTaskEnd(task, waitMs);
       }
 
       task.lastObservationAt = Date.now();
@@ -386,7 +411,8 @@ export class ProcessTaskManager<TMeta extends object> {
   }
 
   private async waitForTaskEnd(task: ManagedTask<TMeta>, waitMs: number): Promise<boolean> {
-    if (task.state !== "running") {
+    // cancel() requests termination; only close/error settles the local process.
+    if (task.proc === null) {
       return true;
     }
 
@@ -405,6 +431,6 @@ export class ProcessTaskManager<TMeta extends object> {
       clearTimeout(timer);
     }
 
-    return result === "finished" || task.state !== "running";
+    return result === "finished" || task.proc === null;
   }
 }

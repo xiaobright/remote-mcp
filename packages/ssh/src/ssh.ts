@@ -10,6 +10,7 @@ import { killProcessTree, windowsHiddenSpawnOptions } from "@remote-mcp/shared/p
 import {
   buildEnvPreamble,
   buildWorkdirPreamble,
+  shellStdinArgs,
   validateShell,
 } from "@remote-mcp/shared/shell";
 import {
@@ -24,7 +25,10 @@ import {
   buildPersistentJobCancelScript,
   buildPersistentJobInspectScript,
   buildPersistentJobRunnerScript,
+  decodeJobPage,
   getPersistentJob,
+  newPersistentJobRecord,
+  requireJobCommandSuccess,
   listPersistentJobs as listPersistentJobsFromStore,
   parsePersistentJobInspect,
   resolveDefaultPersistentJobStorePath,
@@ -177,16 +181,16 @@ const DEFAULT_DEVICE_STORE_PATH = resolve(MODULE_DIR, "..", "devices.json");
 const DEVICE_STORE_PATH = resolve(process.env.SSH_MCP_DEVICES_PATH?.trim() || DEFAULT_DEVICE_STORE_PATH);
 const TASK_OUTPUT_LIMIT = readPositiveIntEnv("SSH_MCP_TASK_OUTPUT_LIMIT", 1048576);
 const MAX_FINISHED_TASKS = readPositiveIntEnv("SSH_MCP_MAX_FINISHED_TASKS", 100);
-const TASK_MIN_POLL_INTERVAL_MS = readPositiveIntEnv("SSH_MCP_MIN_POLL_INTERVAL_MS", 20000);
+const TASK_MIN_POLL_INTERVAL_MS = readPositiveIntEnv("SSH_MCP_MIN_POLL_INTERVAL_MS", 60000);
 const TASK_DEFAULT_READ_WINDOW_CHARS = readPositiveIntEnv("SSH_MCP_DEFAULT_TASK_READ_WINDOW_CHARS", 8192);
 const DEFAULT_SYNC_TIMEOUT_MS = readPositiveIntEnv("SSH_MCP_DEFAULT_SYNC_TIMEOUT_MS", 120000);
 const DEFAULT_WATCH_TIMEOUT_MS = readPositiveIntEnv("SSH_MCP_DEFAULT_WATCH_TIMEOUT_MS", 120000);
-const DEFAULT_TASK_WAIT_MS = readPositiveIntEnv("SSH_MCP_DEFAULT_TASK_WAIT_MS", 30000);
+const DEFAULT_TASK_WAIT_MS = readPositiveIntEnv("SSH_MCP_DEFAULT_TASK_WAIT_MS", 60000);
 const MAX_TOOL_TIMEOUT_MS = readPositiveIntEnv("SSH_MCP_MAX_TOOL_TIMEOUT_MS", 540000);
 const TARGET_PROBE_TIMEOUT_MS = readPositiveIntEnv("SSH_MCP_TARGET_PROBE_TIMEOUT_MS", 15000);
 const PERSISTENT_JOB_STORE_PATH = resolveDefaultPersistentJobStorePath(MODULE_DIR);
 const PERSISTENT_JOB_MAX_RUNTIME_MS = readPositiveIntEnv("SSH_MCP_PERSISTENT_JOB_MAX_RUNTIME_MS", 3600000);
-const PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS = readPositiveIntEnv("SSH_MCP_PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS", 8192);
+const PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS = Math.max(4, readPositiveIntEnv("SSH_MCP_PERSISTENT_JOB_DEFAULT_READ_WINDOW_CHARS", 8192));
 const PERSISTENT_JOB_OP_TIMEOUT_MS = readPositiveIntEnv("SSH_MCP_PERSISTENT_JOB_OP_TIMEOUT_MS", 30000);
 const PERSISTENT_JOB_POLL_INTERVAL_MS = readPositiveIntEnv("SSH_MCP_PERSISTENT_JOB_POLL_INTERVAL_MS", 1000);
 
@@ -441,12 +445,7 @@ function rememberResolvedDevice(profile: SshDeviceProfile, target: string): void
 }
 
 function remoteShellArgs(shellInput?: string, login = true): string[] {
-  const shell = validateShell(shellInput || DEFAULT_SHELL);
-  const base = shell.split(/[\\/]/).pop() || shell;
-  if (login && (base === "bash" || base === "zsh")) {
-    return [shell, "-l", "-s"];
-  }
-  return [shell, "-s"];
+  return shellStdinArgs(shellInput || DEFAULT_SHELL, login);
 }
 
 function buildPreamble(workdir?: string, env?: Record<string, string>): string {
@@ -719,6 +718,7 @@ export async function runSshRawScript(options: SshRunOptions): Promise<SshRawRun
       }
       reject(error);
     });
+    proc.stdin?.on("error", () => {});
     proc.stdin?.write(input);
     proc.stdin?.end();
   });
@@ -903,10 +903,6 @@ export async function testSshTarget(target?: string, timeoutMs = 15000): Promise
 // MCP restarts.
 // ---------------------------------------------------------------------------
 
-function jobDirFor(jobId: string): string {
-  return `$HOME/.remote-mcp/jobs/${jobId}`;
-}
-
 function parseIntOrNull(value: string | undefined): number | null {
   if (!value) {
     return null;
@@ -948,7 +944,7 @@ export interface SshPersistentJobOutput {
   [key: string]: unknown;
 }
 
-async function readPersistentJobPids(jobId: string, target: string): Promise<{
+async function readPersistentJobPids(jobId: string, target: string, sshOptions?: string[]): Promise<{
   pgid: number | null;
   runnerPid: number | null;
 }> {
@@ -962,6 +958,7 @@ async function readPersistentJobPids(jobId: string, target: string): Promise<{
   while (Date.now() <= deadline) {
     const metaResult = await runSshScript({
       target,
+      sshOptions,
       script: metaScript,
       timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
     });
@@ -983,54 +980,32 @@ export async function startPersistentJob(options: {
 }): Promise<PersistentJobRecord> {
   const jobId = randomUUID();
   const maxRuntimeMs = options.maxRuntimeMs ?? PERSISTENT_JOB_MAX_RUNTIME_MS;
+  const { resolved } = await buildSshArgsForRun({ target: options.target, script: "" });
+  const workdir = options.workdir ?? resolved.profile?.defaultWorkdir;
+  const sshOptions = deviceSshOptions(resolved.profile);
   const commandB64 = Buffer.from(options.command, "utf8").toString("base64");
-  const workdirB64 = options.workdir ? Buffer.from(options.workdir, "utf8").toString("base64") : "";
+  const workdirB64 = workdir ? Buffer.from(workdir, "utf8").toString("base64") : "";
   const runnerScript = buildPersistentJobRunnerScript({ jobId, commandB64, workdirB64, maxRuntimeMs });
-
-  // runSshScript resolves the target (with probing if a device name is given)
-  // and returns the resolved target/deviceName in the result.
-  const startResult = await runSshScript({
-    target: options.target,
-    script: runnerScript,
-    timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
+  // Persist the ID and exact connection before launching any side effects.
+  const record = newPersistentJobRecord({
+    jobId, backend: "ssh", workdir, target: resolved.target,
+    requestedTarget: resolved.requestedTarget, sshOptions, maxRuntimeMs,
   });
-  if (startResult.exitCode !== 0) {
-    throw new Error(
-      `Failed to start persistent job ${jobId}: ${startResult.stderr.trim() || `ssh exited with code ${startResult.exitCode}`}`,
-    );
+  upsertPersistentJob(PERSISTENT_JOB_STORE_PATH, record);
+  try {
+    const startResult = await runSshScript({
+      target: record.target, sshOptions, script: runnerScript,
+      timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
+    });
+    requireJobCommandSuccess("start job", startResult);
+    const pids = await readPersistentJobPids(jobId, resolved.target, sshOptions);
+    const tracked = touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, pids);
+    return await refreshPersistentJobRecord(tracked);
+  } catch (error) {
+    const message = `Job ${jobId} start outcome is unconfirmed: ${error instanceof Error ? error.message : String(error)}. Inspect ssh_job status/output for this jobId before retrying; remote logs: ${record.jobDir}.`;
+    touchPersistentJob(PERSISTENT_JOB_STORE_PATH, jobId, { error: message });
+    throw new Error(message);
   }
-
-  // Read back the pgid and runner.pid written by the runner script.
-  const { pgid, runnerPid } = await readPersistentJobPids(jobId, startResult.target);
-  const startedAt = nowIso();
-  const deadlineIso = maxRuntimeMs > 0 ? new Date(Date.now() + maxRuntimeMs).toISOString() : null;
-  const jobDir = jobDirFor(jobId);
-  const record: PersistentJobRecord = {
-    jobId,
-    backend: "ssh",
-    state: "running",
-    shell: "bash",
-    workdir: options.workdir,
-    target: startResult.target,
-    requestedTarget: startResult.requestedTarget,
-    configuredDistro: undefined,
-    jobDir,
-    bodyPath: `${jobDir}/cmd.sh`,
-    stdoutPath: `${jobDir}/stdout.log`,
-    stderrPath: `${jobDir}/stderr.log`,
-    statusPath: `${jobDir}/status`,
-    runnerPid,
-    pgid,
-    maxRuntimeMs,
-    deadlineIso,
-    startedAt,
-    endedAt: null,
-    exitCode: null,
-    error: null,
-    createdAt: startedAt,
-    updatedAt: startedAt,
-  };
-  return upsertPersistentJob(PERSISTENT_JOB_STORE_PATH, record);
 }
 
 export async function getPersistentJobStatus(jobId: string): Promise<PersistentJobRecord> {
@@ -1058,11 +1033,13 @@ async function refreshPersistentJobRecord(record: PersistentJobRecord): Promise<
   });
   const result = await runSshScript({
     target: record.target,
+    sshOptions: record.sshOptions,
     script,
     timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
   });
+  requireJobCommandSuccess("inspect job", result);
   const inspect = parsePersistentJobInspect(result.stdout);
-  const patch: Partial<PersistentJobRecord> = { state: inspect.state };
+  const patch: Partial<PersistentJobRecord> = { state: inspect.state, error: null };
   if (inspect.state === "exited") {
     patch.endedAt = nowIso();
     patch.exitCode = parseIntOrNull(inspect.statusContent);
@@ -1097,17 +1074,21 @@ export async function readPersistentJobOutput(
   });
   const result = await runSshScript({
     target: record.target,
+    sshOptions: record.sshOptions,
     script,
     timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
   });
+  requireJobCommandSuccess("read job output", result);
   const inspect = parsePersistentJobInspect(result.stdout);
-  const stdout = inspect.stdoutB64 ? Buffer.from(inspect.stdoutB64, "base64").toString("utf8") : "";
-  const stderr = inspect.stderrB64 ? Buffer.from(inspect.stderrB64, "base64").toString("utf8") : "";
+  const mayGrow = inspect.state === "running" || inspect.state === "starting";
+  const stdout = decodeJobPage(inspect.stdoutB64, inspect.stdoutOffset, inspect.stdoutNextOffset, inspect.stdoutLength, mayGrow);
+  const stderr = decodeJobPage(inspect.stderrB64, inspect.stderrOffset, inspect.stderrNextOffset, inspect.stderrLength, mayGrow);
 
   // Refresh terminal state into the record if the job just finished.
   let fresh = record;
-  if (inspect.state !== "running" && inspect.state !== "starting" && record.state === "running") {
-    const patch: Partial<PersistentJobRecord> = { state: inspect.state, endedAt: nowIso() };
+  if (inspect.state !== record.state && (record.state === "running" || record.state === "starting")) {
+    const terminal = inspect.state !== "running" && inspect.state !== "starting";
+    const patch: Partial<PersistentJobRecord> = { state: inspect.state, error: null, ...(terminal ? { endedAt: nowIso() } : {}) };
     if (inspect.state === "exited") {
       patch.exitCode = parseIntOrNull(inspect.statusContent);
     } else if (inspect.state === "error") {
@@ -1117,12 +1098,12 @@ export async function readPersistentJobOutput(
   }
   return {
     job: fresh,
-    stdout,
-    stderr,
-    stdoutOffset: inspect.stdoutOffset,
-    stderrOffset: inspect.stderrOffset,
-    nextStdoutOffset: inspect.stdoutNextOffset,
-    nextStderrOffset: inspect.stderrNextOffset,
+    stdout: stdout.text,
+    stderr: stderr.text,
+    stdoutOffset: stdout.offset,
+    stderrOffset: stderr.offset,
+    nextStdoutOffset: stdout.nextOffset,
+    nextStderrOffset: stderr.nextOffset,
     stdoutLength: inspect.stdoutLength,
     stderrLength: inspect.stderrLength,
     readMode,
@@ -1139,17 +1120,19 @@ export async function waitPersistentJob(
     readMode?: PersistentJobReadMode;
   } = {},
 ): Promise<SshPersistentJobOutput & { completed: boolean; timedOut: boolean; waitedMs: number }> {
+  const budget = boundedDuration(waitMs, 60000);
+  waitMs = budget.ms;
   const started = Date.now();
   while (true) {
     const status = await getPersistentJobStatus(jobId);
     if (status.state !== "running" && status.state !== "starting") {
       const output = await readPersistentJobOutput(jobId, options);
-      return { ...output, completed: true, timedOut: false, waitedMs: Date.now() - started };
+      return { ...output, completed: true, timedOut: false, waitedMs: Date.now() - started, waitClamped: budget.clamped, waitMs };
     }
     const elapsed = Date.now() - started;
     if (elapsed >= waitMs) {
       const output = await readPersistentJobOutput(jobId, options);
-      return { ...output, completed: false, timedOut: true, waitedMs: elapsed };
+      return { ...output, completed: false, timedOut: true, waitedMs: Date.now() - started, waitClamped: budget.clamped, waitMs };
     }
     await delay(Math.min(PERSISTENT_JOB_POLL_INTERVAL_MS, Math.max(0, waitMs - elapsed)));
   }
@@ -1163,6 +1146,7 @@ export async function cancelPersistentJob(jobId: string): Promise<PersistentJobR
   const script = buildPersistentJobCancelScript(jobId);
   const result = await runSshScript({
     target: record.target,
+    sshOptions: record.sshOptions,
     script,
     timeoutMs: PERSISTENT_JOB_OP_TIMEOUT_MS,
   });
@@ -1188,5 +1172,5 @@ export async function cancelPersistentJob(jobId: string): Promise<PersistentJobR
 }
 
 export function listPersistentJobs(): PersistentJobRecord[] {
-  return listPersistentJobsFromStore(PERSISTENT_JOB_STORE_PATH);
+  return listPersistentJobsFromStore(PERSISTENT_JOB_STORE_PATH).filter((job) => job.backend === "ssh");
 }

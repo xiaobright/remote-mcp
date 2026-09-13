@@ -100,7 +100,28 @@ export function deletePersistentJob(storePath, jobId) {
     });
 }
 export function resolveDefaultPersistentJobStorePath(moduleDir) {
+    if (process.env.REMOTE_MCP_PERSISTENT_JOB_STORE_PATH) {
+        return resolve(process.env.REMOTE_MCP_PERSISTENT_JOB_STORE_PATH);
+    }
     return resolve(moduleDir, "..", "..", "..", "work", "persistent-jobs.json");
+}
+export function newPersistentJobRecord(options) {
+    const startedAt = nowIso();
+    const jobDir = `$HOME/.remote-mcp/jobs/${options.jobId}`;
+    return {
+        ...options, state: "starting", shell: "bash", jobDir,
+        bodyPath: `${jobDir}/cmd.sh`, stdoutPath: `${jobDir}/stdout.log`,
+        stderrPath: `${jobDir}/stderr.log`, statusPath: `${jobDir}/status`,
+        runnerPid: null, pgid: null,
+        deadlineIso: options.maxRuntimeMs > 0 ? new Date(Date.now() + options.maxRuntimeMs).toISOString() : null,
+        startedAt, endedAt: null, exitCode: null, error: null,
+        createdAt: startedAt, updatedAt: startedAt,
+    };
+}
+export function requireJobCommandSuccess(action, result) {
+    if (result.timedOut || result.exitCode !== 0) {
+        throw new Error(`${action}: ${result.timedOut ? "transport timed out" : `transport exited ${result.exitCode}`}. ${result.stderr.trim()}`);
+    }
 }
 function shellSingleQuote(value) {
     return `'${value.replace(/'/g, "'\\''")}'`;
@@ -136,7 +157,7 @@ export function inferPersistentJobState(statusContent) {
  *   daemon.log    runner supervising shell output
  *   status        "running" while active, exit code string when done
  *   runner.pid    PID of the detached session leader (= PGID)
- *   pgid          PID reported by the spawning shell ($!)
+ *   pgid          same session-leader PID as runner.pid
  *
  * The spawning shell returns immediately after launching setsid, so the
  * caller (wsl.exe / ssh) does not stay attached.
@@ -146,9 +167,10 @@ export function buildPersistentJobRunnerScript(options) {
     // Session leader writes both runner.pid and pgid as $$ (PID == PGID after setsid).
     // Do NOT trust the parent shell's $! — setsid often forks and $! is a short-lived parent.
     return [
+        `command -v bash >/dev/null && command -v setsid >/dev/null && command -v base64 >/dev/null || { printf 'job requires bash, setsid and base64\\n' >&2; exit 127; }`,
         `JOB_ID=${shellSingleQuote(jobId)}`,
         `JOB_DIR="$HOME/.remote-mcp/jobs/$JOB_ID"`,
-        `mkdir -p "$JOB_DIR"`,
+        `mkdir -p "$JOB_DIR" || exit $?`,
         `: > "$JOB_DIR/stdout.log"`,
         `: > "$JOB_DIR/stderr.log"`,
         `: > "$JOB_DIR/daemon.log"`,
@@ -174,11 +196,11 @@ export function buildPersistentJobRunnerScript(options) {
         `  fi`,
         `  return 1`,
         `}`,
-        `workdir="$(decode_b64 "$workdir_b64" 2>/dev/null || true)"`,
-        `if [ -n "$workdir" ]; then cd "$workdir" 2>/dev/null || cd "$HOME"; else cd "$HOME"; fi`,
         `# $$ is the setsid session leader: PID and PGID are identical.`,
         `printf "%s" "$$" > "$job_dir/runner.pid"`,
         `printf "%s" "$$" > "$job_dir/pgid"`,
+        `workdir="$(decode_b64 "$workdir_b64")" || { printf "error: workdir decode failed" > "$job_dir/status"; exit 1; }`,
+        `if ! cd "\${workdir:-$HOME}" 2>"$job_dir/stderr.log"; then printf "error: cannot enter workdir" > "$job_dir/status"; exit 1; fi`,
         `printf "running" > "$job_dir/status"`,
         `expired_file="$job_dir/expired"`,
         `on_term() { if [ -f "$expired_file" ]; then printf "expired" > "$job_dir/status"; else printf "cancelled" > "$job_dir/status"; fi; exit 143; }`,
@@ -220,20 +242,24 @@ export function buildPersistentJobInspectScript(options) {
         `JOB_ID=${shellSingleQuote(jobId)}`,
         `JOB_DIR="$HOME/.remote-mcp/jobs/$JOB_ID"`,
         `STATUS_FILE="$JOB_DIR/status"`,
+        `[ -f "$STATUS_FILE" ] || { printf 'job status is unavailable: %s\\n' "$JOB_ID" >&2; exit 66; }`,
         `OUT="$JOB_DIR/stdout.log"`,
         `ERR="$JOB_DIR/stderr.log"`,
         `READ_MODE=${shellSingleQuote(readMode)}`,
         `SOFF=${soff}`,
         `EOFF=${eoff}`,
+        `SOFF_SET=${options.stdoutOffset === undefined ? 0 : 1}`,
+        `EOFF_SET=${options.stderrOffset === undefined ? 0 : 1}`,
         `TAIL=${tail}`,
         `MAX=${max}`,
         `INCLUDE=${include}`,
         `rc_off=0; rc_end=0; rc_b64=""`,
         `read_chunk() {`,
-        `  local file="$1" req_off="$2" len="$3" off end b64=""`,
+        `  local file="$1" req_off="$2" len="$3" offset_set="$4" off end b64="" window`,
         `  if [ "$TAIL" -gt 0 ] 2>/dev/null; then`,
-        `    off=$((len - TAIL)); [ "$off" -lt 0 ] && off=0`,
-        `  elif [ "$req_off" -gt 0 ] 2>/dev/null; then`,
+        `    window=$TAIL; [ "$window" -gt "$MAX" ] && window=$MAX`,
+        `    off=$((len - window)); [ "$off" -lt 0 ] && off=0`,
+        `  elif [ "$offset_set" = "1" ]; then`,
         `    off=$req_off`,
         `  elif [ "$READ_MODE" = "full" ]; then`,
         `    off=0`,
@@ -250,9 +276,9 @@ export function buildPersistentJobInspectScript(options) {
         `status_content=""; [ -f "$STATUS_FILE" ] && status_content=$(cat "$STATUS_FILE" 2>/dev/null)`,
         `out_len=0; [ -f "$OUT" ] && out_len=$(wc -c < "$OUT" 2>/dev/null || printf 0)`,
         `err_len=0; [ -f "$ERR" ] && err_len=$(wc -c < "$ERR" 2>/dev/null || printf 0)`,
-        `read_chunk "$OUT" "$SOFF" "$out_len"`,
+        `read_chunk "$OUT" "$SOFF" "$out_len" "$SOFF_SET"`,
         `out_off=$rc_off; out_end=$rc_end; out_b64=$rc_b64`,
-        `read_chunk "$ERR" "$EOFF" "$err_len"`,
+        `read_chunk "$ERR" "$EOFF" "$err_len" "$EOFF_SET"`,
         `err_off=$rc_off; err_end=$rc_end; err_b64=$rc_b64`,
         `printf 'STATUS\\t%s\\n' "$status_content"`,
         `printf 'STDOUT_LEN\\t%s\\n' "$out_len"`,
@@ -265,6 +291,24 @@ export function buildPersistentJobInspectScript(options) {
         `printf 'STDERR_B64\\t%s\\n' "$err_b64"`,
     ].join("\n") + "\n";
 }
+/** Keep UTF-8 characters intact while retaining byte-based, caller-owned cursors. */
+export function decodeJobPage(base64, offset, nextOffset, total, mayGrow) {
+    const bytes = Buffer.from(base64, "base64");
+    let start = 0;
+    while (start < bytes.length && (bytes[start] & 0xc0) === 0x80)
+        start += 1;
+    let end = bytes.length;
+    if (end > start && (nextOffset < total || mayGrow)) {
+        let lead = end - 1;
+        while (lead > start && (bytes[lead] & 0xc0) === 0x80)
+            lead -= 1;
+        const byte = bytes[lead];
+        const width = byte >= 0xf0 && byte <= 0xf4 ? 4 : byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xc2 && byte <= 0xdf ? 2 : 1;
+        if (end - lead < width)
+            end = lead;
+    }
+    return { text: bytes.subarray(start, end).toString("utf8"), offset: offset + start, nextOffset: offset + end };
+}
 export function parsePersistentJobInspect(raw) {
     const map = new Map();
     for (const line of raw.split("\n")) {
@@ -273,6 +317,10 @@ export function parsePersistentJobInspect(raw) {
             continue;
         }
         map.set(line.slice(0, idx), line.slice(idx + 1));
+    }
+    for (const key of ["STATUS", "STDOUT_LEN", "STDERR_LEN", "STDOUT_OFFSET", "STDOUT_NEXT", "STDOUT_B64", "STDERR_OFFSET", "STDERR_NEXT", "STDERR_B64"]) {
+        if (!map.has(key))
+            throw new Error(`Invalid job inspection response: missing ${key}. Remote state is unknown; do not restart the job blindly.`);
     }
     const num = (key) => {
         const raw = map.get(key);
@@ -311,20 +359,21 @@ export function buildPersistentJobCancelScript(jobId) {
         `# Prefer runner.pid: it is written by the setsid session leader as $$.`,
         `[ -f "$JOB_DIR/runner.pid" ] && PGID=$(tr -d ' \\t\\r\\n' < "$JOB_DIR/runner.pid" 2>/dev/null)`,
         `if [ -z "$PGID" ] && [ -f "$JOB_DIR/pgid" ]; then PGID=$(tr -d ' \\t\\r\\n' < "$JOB_DIR/pgid" 2>/dev/null); fi`,
+        `cur=$(cat "$STATUS_FILE" 2>/dev/null || true)`,
+        `case "$cur" in`,
+        `  cancelled|expired|error:*) printf 'already_dead\\t%s\\n' "$PGID"; exit 0 ;;`,
+        `esac`,
+        `case "$cur" in`,
+        `  ""|*[!0-9-]*) ;;`,
+        `  *) printf 'already_dead\\t%s\\n' "$PGID"; exit 0 ;;`,
+        `esac`,
         `alive() { kill -0 "$1" 2>/dev/null || kill -0 -"$1" 2>/dev/null; }`,
         `if [ -z "$PGID" ]; then`,
-        `  # No pid files: job may never have started or already cleaned up.`,
-        `  if [ -f "$STATUS_FILE" ]; then`,
-        `    cur=$(cat "$STATUS_FILE" 2>/dev/null || true)`,
-        `    case "$cur" in`,
-        `      running|starting) printf 'cancelled' > "$STATUS_FILE" 2>/dev/null || true ;;`,
-        `    esac`,
-        `  else`,
-        `    printf 'cancelled' > "$STATUS_FILE" 2>/dev/null || true`,
-        `  fi`,
-        `  printf 'cancelled\\tnone\\n'`,
-        `  exit 0`,
+        `  printf 'cancel_unconfirmed: runner PID is unavailable\\n' >&2`,
+        `  exit 1`,
         `fi`,
+        `case "$PGID" in *[!0-9]*) printf 'cancel_unconfirmed: invalid PID\\n' >&2; exit 1 ;; esac`,
+        `[ "$PGID" -gt 1 ] || { printf 'cancel_unconfirmed: unsafe PID\\n' >&2; exit 1; }`,
         `if ! alive "$PGID"; then`,
         `  # Already dead — do not overwrite a real exit code with cancelled.`,
         `  if [ -f "$STATUS_FILE" ]; then`,

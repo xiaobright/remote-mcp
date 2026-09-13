@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
+import { StringDecoder } from "node:string_decoder";
 import { killProcessTree } from "./process.js";
 function nowIso() {
     return new Date().toISOString();
@@ -13,9 +13,10 @@ function makeFinishedLatch() {
 }
 function sliceTaskStream(content, baseOffset, requestedOffset, tailChars, readMode = "delta", defaultReadWindowChars = 8192) {
     const totalLength = baseOffset + content.length;
+    const limit = Math.max(2, defaultReadWindowChars);
     let offset = baseOffset;
     if (typeof tailChars === "number") {
-        offset = Math.max(baseOffset, totalLength - tailChars);
+        offset = Math.max(baseOffset, totalLength - Math.min(tailChars, limit));
     }
     else if (typeof requestedOffset === "number") {
         offset = Math.max(baseOffset, requestedOffset);
@@ -24,14 +25,23 @@ function sliceTaskStream(content, baseOffset, requestedOffset, tailChars, readMo
         offset = baseOffset;
     }
     else {
-        offset = Math.max(baseOffset, totalLength - defaultReadWindowChars);
+        offset = Math.max(baseOffset, totalLength - limit);
     }
-    const start = offset - baseOffset;
+    offset = Math.min(offset, totalLength);
+    let start = offset - baseOffset;
+    if (start > 0 && /[\uDC00-\uDFFF]/.test(content[start]))
+        start += 1;
+    offset = baseOffset + start;
+    let end = Math.min(content.length, start + limit);
+    if (end < content.length && /[\uD800-\uDBFF]/.test(content[end - 1]))
+        end -= 1;
+    const nextOffset = baseOffset + end;
     return {
-        text: content.slice(start),
+        text: content.slice(start, end),
         offset,
-        nextOffset: totalLength,
-        truncated: baseOffset > 0 || offset > baseOffset,
+        nextOffset,
+        truncated: baseOffset > 0 || offset > baseOffset || nextOffset < totalLength,
+        hasMore: nextOffset < totalLength,
     };
 }
 export class ProcessTaskManager {
@@ -56,6 +66,8 @@ export class ProcessTaskManager {
             error: null,
             stdout: "",
             stderr: "",
+            stdoutDecoder: new StringDecoder("utf8"),
+            stderrDecoder: new StringDecoder("utf8"),
             stdoutBaseOffset: 0,
             stderrBaseOffset: 0,
             finished: latch.finished,
@@ -68,7 +80,9 @@ export class ProcessTaskManager {
         proc.stdout?.on("data", (data) => this.appendTaskOutput(task, "stdout", data));
         proc.stderr?.on("data", (data) => this.appendTaskOutput(task, "stderr", data));
         proc.on("close", (code, signal) => {
-            if (task.state !== "cancelled") {
+            this.appendTaskText(task, "stdout", task.stdoutDecoder.end());
+            this.appendTaskText(task, "stderr", task.stderrDecoder.end());
+            if (task.state === "running") {
                 task.state = "exited";
             }
             task.exitCode = code ?? -1;
@@ -92,6 +106,8 @@ export class ProcessTaskManager {
             this.pruneFinishedTasks();
         });
         if (typeof options.input === "string") {
+            // A command may exit before it has consumed stdin; do not crash the MCP on EPIPE.
+            proc.stdin?.on("error", () => { });
             proc.stdin?.write(options.input);
             proc.stdin?.end();
         }
@@ -152,11 +168,16 @@ export class ProcessTaskManager {
         }
     }
     appendTaskOutput(task, stream, data) {
-        const text = data.toString();
+        const decoder = stream === "stdout" ? task.stdoutDecoder : task.stderrDecoder;
+        this.appendTaskText(task, stream, decoder.write(data));
+    }
+    appendTaskText(task, stream, text) {
         const baseKey = stream === "stdout" ? "stdoutBaseOffset" : "stderrBaseOffset";
         task[stream] += text;
-        const overflow = task[stream].length - this.options.outputLimit;
+        let overflow = task[stream].length - this.options.outputLimit;
         if (overflow > 0) {
+            if (/[\uDC00-\uDFFF]/.test(task[stream][overflow]))
+                overflow += 1;
             task[stream] = task[stream].slice(overflow);
             task[baseKey] += overflow;
         }
@@ -212,6 +233,8 @@ export class ProcessTaskManager {
             nextStderrOffset: stderrSlice.nextOffset,
             stdoutTruncated: stdoutSlice.truncated,
             stderrTruncated: stderrSlice.truncated,
+            stdoutHasMore: stdoutSlice.hasMore,
+            stderrHasMore: stderrSlice.hasMore,
             readMode: options.readMode ?? "delta",
         };
     }
@@ -227,7 +250,7 @@ export class ProcessTaskManager {
             const elapsed = task.lastObservationAt === null ? this.options.minPollIntervalMs : now - task.lastObservationAt;
             const waitMs = task.state === "running" ? Math.max(0, this.options.minPollIntervalMs - elapsed) : 0;
             if (waitMs > 0) {
-                await delay(waitMs);
+                await this.waitForTaskEnd(task, waitMs);
             }
             task.lastObservationAt = Date.now();
             const poll = {
@@ -243,7 +266,8 @@ export class ProcessTaskManager {
         }
     }
     async waitForTaskEnd(task, waitMs) {
-        if (task.state !== "running") {
+        // cancel() requests termination; only close/error settles the local process.
+        if (task.proc === null) {
             return true;
         }
         let timer = null;
@@ -258,7 +282,7 @@ export class ProcessTaskManager {
         if (timer) {
             clearTimeout(timer);
         }
-        return result === "finished" || task.state !== "running";
+        return result === "finished" || task.proc === null;
     }
 }
 //# sourceMappingURL=taskManager.js.map

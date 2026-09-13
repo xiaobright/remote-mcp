@@ -41,6 +41,12 @@ export function validateShell(shell: string): string {
   return trimmed;
 }
 
+export function shellStdinArgs(shellInput = "bash", login = true): string[] {
+  const shell = validateShell(shellInput);
+  const base = shell.split(/[\\/]/).pop();
+  return login && (base === "bash" || base === "zsh") ? [shell, "-l", "-s"] : [shell, "-s"];
+}
+
 export function validateEnvName(name: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
     throw new Error(`Unsafe environment variable name: ${name}`);
@@ -57,5 +63,5 @@ export function buildEnvPreamble(env?: Record<string, string>): string {
 }
 
 export function buildWorkdirPreamble(workdir?: string): string {
-  return workdir ? `cd -- ${shellQuote(workdir)}\n` : "";
+  return workdir ? `cd -- ${shellQuote(workdir)} || exit $?\n` : "";
 }

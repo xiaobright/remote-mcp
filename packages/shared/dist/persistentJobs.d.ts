@@ -9,6 +9,7 @@ export interface PersistentJobRecord {
     workdir?: string;
     target?: string;
     requestedTarget?: string;
+    sshOptions?: string[];
     configuredDistro?: string | null;
     jobDir: string;
     bodyPath: string;
@@ -40,6 +41,12 @@ export declare function listPersistentJobs(storePath: string): PersistentJobReco
 export declare function touchPersistentJob(storePath: string, jobId: string, patch: Partial<PersistentJobRecord>): PersistentJobRecord;
 export declare function deletePersistentJob(storePath: string, jobId: string): void;
 export declare function resolveDefaultPersistentJobStorePath(moduleDir: string): string;
+export declare function newPersistentJobRecord(options: Pick<PersistentJobRecord, "jobId" | "backend" | "maxRuntimeMs" | "workdir" | "target" | "requestedTarget" | "configuredDistro" | "sshOptions">): PersistentJobRecord;
+export declare function requireJobCommandSuccess(action: string, result: {
+    exitCode: number;
+    stderr: string;
+    timedOut?: boolean;
+}): void;
 export declare function inferPersistentJobState(statusContent: string): PersistentJobState;
 export interface PersistentJobRunnerOptions {
     jobId: string;
@@ -59,7 +66,7 @@ export interface PersistentJobRunnerOptions {
  *   daemon.log    runner supervising shell output
  *   status        "running" while active, exit code string when done
  *   runner.pid    PID of the detached session leader (= PGID)
- *   pgid          PID reported by the spawning shell ($!)
+ *   pgid          same session-leader PID as runner.pid
  *
  * The spawning shell returns immediately after launching setsid, so the
  * caller (wsl.exe / ssh) does not stay attached.
@@ -94,6 +101,12 @@ export interface PersistentJobInspectResult {
     stderrB64: string;
     state: PersistentJobState;
 }
+/** Keep UTF-8 characters intact while retaining byte-based, caller-owned cursors. */
+export declare function decodeJobPage(base64: string, offset: number, nextOffset: number, total: number, mayGrow: boolean): {
+    text: string;
+    offset: number;
+    nextOffset: number;
+};
 export declare function parsePersistentJobInspect(raw: string): PersistentJobInspectResult;
 /**
  * Builds a bash script that cancels a persistent job by sending SIGTERM to

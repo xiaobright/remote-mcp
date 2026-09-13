@@ -41,6 +41,14 @@
     "./task-manager": {
       "types": "./dist/taskManager.d.ts",
       "default": "./dist/taskManager.js"
+    },
+    "./tool-surface": {
+      "types": "./dist/toolSurface.d.ts",
+      "default": "./dist/toolSurface.js"
+    },
+    "./output": {
+      "types": "./dist/output.d.ts",
+      "default": "./dist/output.js"
     }
   },
   "scripts": {
