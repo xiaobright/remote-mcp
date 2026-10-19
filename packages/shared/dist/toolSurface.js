@@ -12,14 +12,14 @@ export function registerHelpTool(server, backend, features) {
     const waitMs = readPositiveIntEnv(`${prefix}_MCP_DEFAULT_TASK_WAIT_MS`, 60000);
     const topics = {
         overview: [
-            `${backend}_exec: commands; ${backend}_script: multi-line scripts. Both use a fresh shell.`,
+            `${backend}_exec: commands or multi-line scripts/heredocs in a fresh shell.`,
             `${backend}_task: attached async/watch work; lost on MCP restart.`,
             `${backend}_job: detached work with disk logs; survives MCP restart, not host/WSL shutdown.`,
             `Help topics: execution, jobs, output, connection, files. Ordinary calls do not require help first.`,
             `Optional tools: files=${features.files ? features.fileApi : "disabled"}, admin=${features.admin ? "enabled" : "disabled"}.`,
         ],
         execution: [
-            `Use ${backend}_exec for commands, ${backend}_script for multi-line scripts/heredocs. Content is sent through stdin, not nested Windows shell quoting.`,
+            `Use ${backend}_exec for both one-line commands and multi-line scripts/heredocs. Content is sent through stdin, not nested Windows shell quoting.`,
             `Each call starts a fresh non-interactive shell. Set workdir explicitly; environment/cd changes do not carry to later calls. A failed cd aborts the call.`,
             `mode="sync" waits for completion (default timeout 120000 ms). timeout_ms is capped by ${prefix}_MCP_MAX_TOOL_TIMEOUT_MS (default 540000).`,
             `mode="async" returns taskId immediately. mode="watch" waits, then on_timeout="detach" keeps the task running; "kill" requests cancellation.`,
@@ -59,8 +59,8 @@ export function registerHelpTool(server, backend, features) {
             `Restart the MCP server/client connection after changing environment settings. Each execution uses a fresh local ssh process; there is no persistent remote shell.`,
         ],
         files: [
-            `Dedicated file tools are ${features.files ? `enabled (${features.fileApi})` : "disabled"}. This does not prohibit file operations through exec/script and is not a security sandbox.`,
-            `Use exec with rg/grep, ls/stat or bounded text reads; use script for heredocs or guarded edits. Check old text and match count before replacing; verify the result.`,
+            `Dedicated file tools are ${features.files ? `enabled (${features.fileApi})` : "disabled"}. This does not prohibit file operations through exec and is not a security sandbox.`,
+            `Use exec with rg/grep, ls/stat or bounded text reads; use a heredoc for guarded edits. Check old text and match count before replacing; verify the result.`,
             `Legacy file tools are retained only as an opt-in: REMOTE_MCP_ENABLE_FILE_TOOLS=1, with REMOTE_MCP_FILE_API=unified or split. Restart to change registration.`,
             `The legacy patch implementation is a subset (Add/Update only), not a native-editor replacement; encoding/BOM, symlink, concurrency and multi-file atomicity guarantees are limited.`,
         ],

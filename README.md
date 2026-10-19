@@ -2,7 +2,7 @@
 
 [English README](README.en.md)
 
-`remote-mcp` 是面向 coding agent 的 SSH / WSL 执行工具：可靠传递命令和多行脚本、管理后台任务、续读有界日志。默认每个服务器只提供 **5 个工具**，不要求安装配套 skill。
+`remote-mcp` 是面向 coding agent 的 SSH / WSL 执行工具：可靠传递命令和多行脚本、管理后台任务、续读有界日志。默认每个服务器只提供 **4 个工具**，不要求安装配套 skill。
 
 它不是远程常驻 agent：MCP 服务器运行在本地，SSH 版本调用本机 `ssh`，WSL 版本调用 `wsl.exe`。每次执行使用新 shell，不保留上次的 `cd` 或环境变量。持久任务另需远端具备 `bash`、`setsid`、`base64` 和基本 shell 工具。
 
@@ -22,7 +22,7 @@
 - 通过 SSH 操作开发板、服务器等 Linux 设备。
 - 执行多行脚本和 here-doc，避免嵌套 Windows shell 转义。
 - 等待构建、训练、服务，并在 MCP 重启后重新接入持久任务。
-- 文件读取、搜索和修改默认通过 `exec` / `script` 完成。
+- 文件读取、搜索和修改默认通过 `exec` 完成。
 
 ## 包结构
 
@@ -36,11 +36,12 @@ SSH 和 WSL 分开加载。你只需要 SSH 就只启用 SSH MCP，只需要 WSL
 
 | WSL | SSH | 用途 |
 | --- | --- | --- |
-| `wsl_exec` | `ssh_exec` | 命令，默认同步等待 |
-| `wsl_script` | `ssh_script` | 多行脚本，通过 stdin 传递 |
-| `wsl_task` | `ssh_task` | 管理 exec/script 的 async/watch 任务 |
+| `wsl_exec` | `ssh_exec` | 命令或多行脚本，内容走 stdin，默认同步等待 |
+| `wsl_task` | `ssh_task` | 管理 exec 的 async/watch 任务 |
 | `wsl_job` | `ssh_job` | 可跨 MCP 重启的持久任务 |
 | `wsl_help` | `ssh_help` | 按需说明 |
+
+升级提示：`wsl_script` / `ssh_script` 已合并到对应的 `exec`，脚本内容改用 `command` 参数传入。同步更新客户端指引，并重启 MCP 连接以刷新工具列表。
 
 `help(topic)` 支持 `overview`（默认）、`execution`、`jobs`、`output`、`connection`、`files`。普通调用无需先读帮助；帮助不会执行命令、改变配置或动态启用工具。
 
@@ -145,7 +146,7 @@ WSL_MCP_DEFAULT_DISTRO = "Ubuntu-24.04"
 - SSH MCP 不保存密码。建议使用 SSH key。
 - 默认 `StrictHostKeyChecking=accept-new` 便于首次连接；生产环境可设 `SSH_MCP_STRICT_HOST_KEY_CHECKING=yes`。
 - `devices.json`、`.env` 和 `node_modules` 已加入 `.gitignore`。device 与 persistent job 元数据写入有本地文件锁。
-- exec/script/job 都能产生真实副作用；默认禁用文件工具不降低 shell 权限。
+- exec/job 都能产生真实副作用；默认禁用文件工具不降低 shell 权限。
 - `*_file_apply_patch` 不支持删除文件。
 - WSL 工具默认拦截常见删除命令（`rm`/`rmdir`/`unlink`/带 delete 的 `rsync`）目标落在 `/mnt` 的情况。这是**最佳努力**，不是沙箱：`command rm`、`find -delete`、Python/`os.remove` 等仍可绕过。
 - 这个项目由 AI 生成，公开使用前请按自己的威胁模型审计。

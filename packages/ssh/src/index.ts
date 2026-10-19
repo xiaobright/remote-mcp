@@ -524,7 +524,7 @@ if (features.admin) server.registerTool(
         .describe("Identity file path for upsert_device; stored as non-secret metadata."),
       defaultWorkdir: z.string()
         .optional()
-        .describe("Default remote workdir used by ssh_exec/ssh_script when workdir is omitted."),
+        .describe("Default remote workdir when workdir is omitted."),
       ssh_options: z.array(z.string())
         .optional()
         .describe('Per-device extra ssh argv items, e.g. ["-o","ServerAliveInterval=30"].'),
@@ -574,7 +574,7 @@ server.registerTool(
   "ssh_task",
   {
     title: "Manage SSH Async Task",
-    description: `Wait/read/cancel attached exec/script tasks. Lost on MCP restart; persistent work uses ssh_job. Prefer wait (default 60s); reuse offsets for capped output. Details: ssh_help topic="output".`,
+    description: `Wait/read/cancel async/watch tasks started by ssh_exec. Lost on MCP restart; durable work uses ssh_job. Prefer wait (default 60s); reuse offsets for capped output. Details: ssh_help topic="output".`,
     inputSchema: z.object({
       action: z.enum(["status", "output", "wait", "cancel", "list"]),
       taskId: z.string()
@@ -637,11 +637,11 @@ server.registerTool(
   "ssh_exec",
   {
     title: "Run SSH Command",
-    description: `Run a command via stdin in a fresh SSH shell. sync waits; async/watch return taskId for ssh_task. Sync timeout stops the local child, not necessarily remote descendants. Multi-line: ssh_script; persistent work: ssh_job.`,
+    description: `Run a command or multi-line script in a fresh SSH shell (sent via stdin, no quote nesting). sync waits; async/watch return taskId for ssh_task. Sync timeout kills the local child, not necessarily remote descendants. Durable work: ssh_job.`,
     inputSchema: z.object({
       command: z.string()
         .min(1, "command is required")
-        .describe("Shell command."),
+        .describe("Shell command or multi-line script/heredoc."),
       target: z.string()
         .optional()
         .describe("SSH target/device; defaults to the configured target."),
@@ -661,7 +661,7 @@ server.registerTool(
         .optional()
         .describe('Extra ssh argv items, e.g. ["-p","2222","-i","C:/path/key"].'),
       mode: runModeSchema
-        .default("sync"),
+        .default("sync"),
       timeout_ms: z.number()
         .int()
         .positive()
@@ -705,81 +705,6 @@ server.registerTool(
         ...params,
         script: params.command,
       });
-    } catch (error) {
-      return errorResponse(error);
-    }
-  },
-);
-
-server.registerTool(
-  "ssh_script",
-  {
-    title: "Run SSH Script",
-    description: `Run a multi-line script/heredoc via stdin in a fresh SSH shell. sync waits; async/watch use ssh_task. Sync timeout stops the local child, not necessarily remote descendants. Durable work: ssh_job.`,
-    inputSchema: z.object({
-      script: z.string()
-        .min(1, "script is required")
-        .describe("Multi-line shell script."),
-      target: z.string()
-        .optional()
-        .describe("SSH target/device; defaults to the configured target."),
-      shell: z.string()
-        .default("bash")
-        .describe("Remote shell."),
-      login: z.boolean()
-        .default(true)
-        .describe("Use login shell mode for bash/zsh."),
-      workdir: z.string()
-        .optional()
-        .describe("Working directory; failed cd aborts execution."),
-      env: z.record(z.string())
-        .optional()
-        .describe("Environment for this call."),
-      ssh_options: z.array(z.string())
-        .optional()
-        .describe('Extra ssh argv items, e.g. ["-p","2222","-i","C:/path/key"].'),
-      mode: runModeSchema
-        .default("sync"),
-      timeout_ms: z.number()
-        .int()
-        .positive()
-        .optional()
-        .describe("sync/watch timeout in milliseconds."),
-      on_timeout: timeoutBehaviorSchema
-        .default("detach")
-        .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
-      read_mode: z.enum(["delta", "full"])
-        .optional()
-        .describe('No offset: tail (delta) or first page (full).'),
-      tail_chars: z.number()
-        .int()
-        .positive()
-        .optional()
-        .describe("watch only: capped tail window."),
-    }).strict(),
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: false,
-      openWorldHint: true,
-    },
-  },
-  async (params: {
-    script: string;
-    target?: string;
-    shell?: string;
-    login?: boolean;
-    workdir?: string;
-    env?: Record<string, string>;
-    ssh_options?: string[];
-    mode?: SshRunMode;
-    timeout_ms?: number;
-    on_timeout?: SshTimeoutBehavior;
-    read_mode?: SshReadMode;
-    tail_chars?: number;
-  }) => {
-    try {
-      return await runScriptTool(params);
     } catch (error) {
       return errorResponse(error);
     }

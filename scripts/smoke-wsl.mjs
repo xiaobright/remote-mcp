@@ -38,7 +38,7 @@ try {
   assert.equal(plain.structuredContent.stdout, undefined);
   passed("exec output and exit code");
 
-  const literal = await call("script", { script: "cat <<'LITERAL'\n$HOME $(literal) \"quotes\" 中文\nLITERAL", shell: "sh", workdir: "/tmp" });
+  const literal = await call("exec", { command: "cat <<'LITERAL'\n$HOME $(literal) \"quotes\" 中文\nLITERAL", shell: "sh", workdir: "/tmp" });
   assert.match(textOf(literal), /\$HOME \$\(literal\) "quotes" 中文/);
   const badDir = await call("exec", { command: "printf 'MUST_NOT_EXECUTE'", workdir: "/__remote_mcp_missing_" + randomUUID() });
   assert.notEqual(badDir.structuredContent.exitCode, 0);
@@ -50,7 +50,7 @@ try {
   assert.equal(readFileSync(large.structuredContent.fullOutput.stdout, "utf8"), "x".repeat(200) + "END");
   passed("bounded sync output with recoverable full log");
 
-  const attached = await call("script", { script: "printf before; sleep 1; printf after", mode: "async" });
+  const attached = await call("exec", { command: "printf before; sleep 1; printf after", mode: "async" });
   const waited = await call("task", { action: "wait", taskId: attached.structuredContent.taskId, wait_ms: 60000, stdoutOffset: 0, stderrOffset: 0 });
   assert.equal(waited.structuredContent.completed, true);
   assert.equal(waited.structuredContent.task.exitCode, 0);

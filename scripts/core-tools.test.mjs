@@ -33,7 +33,7 @@ test("actual tools/call preserves stdin, quoting, workdir and environment", asyn
   const { client } = await fixture(t, { REMOTE_MCP_OUTPUT_LIMIT_CHARS: "8192" });
   const script = "printf '%s\\n' '$VAR $(literal) \"quotes\" 中文'";
   const result = await client.callTool({
-    name: "ssh_script", arguments: { script, workdir: "/tmp/a'b", env: { EXAMPLE: "a'b" }, shell: "sh" },
+    name: "ssh_exec", arguments: { command: script, workdir: "/tmp/a'b", env: { EXAMPLE: "a'b" }, shell: "sh" },
   });
   assert.equal(result.structuredContent.exitCode, 0);
   assert.equal(result.structuredContent.stdout, undefined);

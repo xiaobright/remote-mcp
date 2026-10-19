@@ -7,8 +7,8 @@ for (const backend of ["ssh", "wsl"]) {
     const client = await connectServer(backend, { REMOTE_MCP_FILE_API: "unified" });
     try {
       const { tools } = await client.listTools();
-      assert.deepEqual(tools.map((t) => t.name).sort(), ["exec", "script", "task", "job", "help"].map((n) => `${backend}_${n}`).sort());
-      assert.ok(JSON.stringify(tools).length < 8500, "full schema budget, not just description length");
+      assert.deepEqual(tools.map((t) => t.name).sort(), ["exec", "task", "job", "help"].map((n) => `${backend}_${n}`).sort());
+      assert.ok(JSON.stringify(tools).length < 6000, "full schema budget, not just description length");
       for (const tool of tools) assert.doesNotMatch(tool.description, /remote-execution skill|prefer.*file_/i);
       const overview = await client.callTool({ name: `${backend}_help`, arguments: {} });
       assert.match(textOf(overview), /files=disabled/);
@@ -39,7 +39,7 @@ for (const backend of ["ssh", "wsl"]) {
         assert.ok(names.includes(backend === "ssh" ? "ssh_profile" : "wsl_session"));
         const files = tools.filter((t) => t.name.startsWith(`${backend}_file`));
         assert.equal(files.length, mode === "split" ? 5 : 1);
-        assert.equal(tools.length, mode === "split" ? 11 : 7);
+        assert.equal(tools.length, mode === "split" ? 10 : 6);
         if (mode === "unified") {
           assert.ok(files[0].inputSchema.properties.action);
           assert.ok(files[0].inputSchema.properties.path);

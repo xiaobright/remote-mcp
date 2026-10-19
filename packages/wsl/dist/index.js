@@ -6,7 +6,7 @@ import { errorResponse } from "@remote-mcp/shared/mcp";
 import { commandOutputResponse, outputResponse } from "@remote-mcp/shared/output";
 import { registerHelpTool, toolFeatures } from "@remote-mcp/shared/tool-surface";
 import { registerRemoteFileTools, registerUnifiedRemoteFileTools } from "@remote-mcp/shared/remote";
-import { execWsl, execWslAsync, execWslScript, execWslScriptAsync, runWslRawScript, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, startPersistentJob, getPersistentJobStatus, readPersistentJobOutput, waitPersistentJob, cancelPersistentJob, listPersistentJobs, } from "./wsl.js";
+import { execWslScript, execWslScriptAsync, runWslRawScript, watchWslTask, startSession, stopSession, stopSessionSync, cancelAllTasksSync, cancelTask, setDistro, getDistro, getDefaultDistro, getSessionState, observeTaskOutput, observeTaskStatus, listDistros, listTasks, waitTask, startPersistentJob, getPersistentJobStatus, readPersistentJobOutput, waitPersistentJob, cancelPersistentJob, listPersistentJobs, } from "./wsl.js";
 const server = new McpServer({
     name: "wsl-mcp-server",
     version: "1.0.0",
@@ -300,38 +300,25 @@ async function handleJobAction(params) {
     }
 }
 async function runCommandTool(params) {
-    const mode = params.mode ?? "sync";
-    const distro = await resolveRequestedDistro(params.distro);
-    if (mode === "async") {
-        const task = await execWslAsync(params.command, params.workdir, { distro });
-        return { content: [{ type: "text", text: formatTaskStarted(task) }], structuredContent: task };
-    }
-    if (mode === "watch") {
-        const output = await watchWslTask(params.command, "bash", params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
-            tailChars: params.tail_chars,
-            readMode: params.read_mode,
-        }, distro);
-        return outputResponse(formatTaskOutput(output), output);
-    }
-    const result = await execWsl(params.command, params.workdir, { timeoutMs: params.timeout_ms, distro });
-    return commandOutputResponse(result, formatCommandResult);
-}
-async function runScriptTool(params) {
     const shell = params.shell ?? "bash";
     const mode = params.mode ?? "sync";
+    const command = params.command.endsWith("\n") ? params.command : `${params.command}\n`;
     const distro = await resolveRequestedDistro(params.distro);
     if (mode === "async") {
-        const task = await execWslScriptAsync(params.script, shell, params.workdir, { distro });
+        const task = await execWslScriptAsync(command, shell, params.workdir, { distro });
         return { content: [{ type: "text", text: formatTaskStarted(task) }], structuredContent: task };
     }
     if (mode === "watch") {
-        const output = await watchWslTask(params.script, shell, params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
+        const output = await watchWslTask(command, shell, params.workdir, params.timeout_ms, params.on_timeout ?? "detach", {
             tailChars: params.tail_chars,
             readMode: params.read_mode,
         }, distro);
         return outputResponse(formatTaskOutput(output), output);
     }
-    const result = await execWslScript(params.script, shell, params.workdir, { timeoutMs: params.timeout_ms, distro });
+    const result = await execWslScript(command, shell, params.workdir, {
+        timeoutMs: params.timeout_ms,
+        distro,
+    });
     return commandOutputResponse(result, formatCommandResult);
 }
 // Tool invocations go only through registerTool callbacks so MCP SDK Zod
@@ -384,7 +371,7 @@ if (features.admin)
     });
 server.registerTool("wsl_task", {
     title: "Manage WSL Async Task",
-    description: `Wait/read/cancel attached exec/script tasks. Lost on MCP restart; persistent work uses wsl_job. Prefer wait (default 60s); reuse offsets for capped output. Details: wsl_help topic="output".`,
+    description: `Wait/read/cancel async/watch tasks started by wsl_exec. Lost on MCP restart; durable work uses wsl_job. Prefer wait (default 60s); reuse offsets for capped output. Details: wsl_help topic="output".`,
     inputSchema: z.object({
         action: z.enum(["status", "output", "wait", "cancel", "list"]),
         taskId: z.string()
@@ -435,55 +422,11 @@ server.registerTool("wsl_task", {
 });
 server.registerTool("wsl_exec", {
     title: "Run WSL Command",
-    description: `Run a command in a fresh WSL shell. sync waits; async/watch return taskId for wsl_task. Sync timeout stops the local child; use wsl_job for persistence. Multi-line: wsl_script. Delete Windows-mounted paths on the host.`,
+    description: `Run a command or multi-line script in a fresh WSL shell (sent via stdin, no quote nesting). sync waits; async/watch return taskId for wsl_task. Sync timeout kills the local child; use wsl_job for work that must survive. Delete /mnt paths on the Windows host.`,
     inputSchema: z.object({
         command: z.string()
             .min(1, "command is required")
-            .describe("Shell command."),
-        workdir: z.string()
-            .optional()
-            .describe("Working directory; failed cd aborts execution."),
-        mode: runModeSchema
-            .default("sync"),
-        timeout_ms: z.number()
-            .int()
-            .positive()
-            .optional()
-            .describe("sync/watch timeout in milliseconds."),
-        on_timeout: timeoutBehaviorSchema
-            .default("detach")
-            .describe('watch timeout behavior: "detach" keeps the task running; "kill" cancels it.'),
-        read_mode: z.enum(["delta", "full"])
-            .optional()
-            .describe('No offset: tail (delta) or first page (full).'),
-        tail_chars: z.number()
-            .int()
-            .positive()
-            .optional()
-            .describe("watch only: capped tail window."),
-        distro: distroField,
-    }).strict(),
-    annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: false,
-        openWorldHint: true,
-    },
-}, async (params) => {
-    try {
-        return await runCommandTool(params);
-    }
-    catch (error) {
-        return errorResponse(error);
-    }
-});
-server.registerTool("wsl_script", {
-    title: "Run WSL Script",
-    description: `Run a multi-line script/heredoc via stdin in a fresh WSL shell. sync waits; async/watch use wsl_task. Sync timeout stops the local child; durable work uses wsl_job. Delete Windows-mounted paths on the host.`,
-    inputSchema: z.object({
-        script: z.string()
-            .min(1, "script is required")
-            .describe("Multi-line shell script."),
+            .describe("Shell command or multi-line script/heredoc."),
         shell: z.string()
             .default("bash")
             .describe("Shell executable."),
@@ -518,7 +461,7 @@ server.registerTool("wsl_script", {
     },
 }, async (params) => {
     try {
-        return await runScriptTool(params);
+        return await runCommandTool(params);
     }
     catch (error) {
         return errorResponse(error);

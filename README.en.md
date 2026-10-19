@@ -2,7 +2,7 @@
 
 [中文 README](README.md)
 
-`remote-mcp` provides SSH/WSL command execution, multi-line scripts, background jobs and bounded log reads for coding agents. Each server exposes **five tools by default**, with on-demand help and no required client-specific skill.
+`remote-mcp` provides SSH/WSL command execution, multi-line scripts, background jobs and bounded log reads for coding agents. Each server exposes **four tools by default**, with on-demand help and no required client-specific skill.
 
 It is not a remote resident agent. The MCP servers run locally, using `ssh` or `wsl.exe`. Every execution starts a fresh shell; previous environment/cd changes do not carry over. Persistent jobs require bash, setsid, base64 and basic shell utilities on the execution host.
 
@@ -21,7 +21,7 @@ Typical use cases:
 - Let an agent work on WSL projects from Windows.
 - Run scripts and heredocs on SSH-accessible Linux devices and servers.
 - Manage builds, training and services, reconnecting to persistent jobs after MCP restarts.
-- Read, search and modify files through exec/script by default.
+- Read, search and modify files through exec by default.
 
 ## Packages
 
@@ -35,11 +35,12 @@ SSH and WSL are loaded separately, so clients can enable only the transport they
 
 | WSL | SSH | Purpose |
 | --- | --- | --- |
-| `wsl_exec` | `ssh_exec` | Commands, synchronous by default |
-| `wsl_script` | `ssh_script` | Multi-line scripts through stdin |
-| `wsl_task` | `ssh_task` | Attached async/watch task management |
+| `wsl_exec` | `ssh_exec` | Command or multi-line script via stdin; sync by default |
+| `wsl_task` | `ssh_task` | Manage async/watch tasks from exec |
 | `wsl_job` | `ssh_job` | Persistent detached jobs |
 | `wsl_help` | `ssh_help` | On-demand topic help |
+
+Upgrading: `wsl_script` / `ssh_script` have been merged into their corresponding `exec` tools. Pass script content in `command`, update client instructions, and restart the MCP connection to refresh the tool list.
 
 Help topics: `overview` (default), `execution`, `jobs`, `output`, `connection`, `files`. Ordinary calls do not require help first. Help does not execute commands, alter configuration or dynamically load other tools.
 
@@ -143,7 +144,7 @@ MCP client configuration formats vary. Adjust field names and paths for your cli
 
 - The SSH MCP does not store SSH passwords. Use SSH keys.
 - `devices.json`, `.env`, and `node_modules` are git-ignored.
-- Exec/script/job can perform real writes; disabling file tools does not reduce shell permissions.
+- Exec/job can perform real writes; disabling file tools does not reduce shell permissions.
 - `*_file_apply_patch` does not support file deletion.
 - WSL blocks common delete operations under `/mnt` best-effort. This is not a sandbox and can be bypassed; delete Windows-mounted paths on the Windows host.
 - This project is AI-generated. Review it according to your own threat model before use.

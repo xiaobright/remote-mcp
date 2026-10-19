@@ -10,15 +10,12 @@ shell.
 ## Default Tools
 
 - `wsl_exec`
-  - Run a short command inside WSL.
+  - Run a command or multi-line script inside WSL; content goes through stdin.
+  - Prefer it for pipes, redirects, here-docs, `$()`, `$VAR`, nested quotes; it is
+    one tool for both a single line and a whole script. `shell` defaults to bash.
   - Optional `distro` one-shot override (does not change session default).
-- `wsl_script`
-  - Run a multi-line WSL shell script through stdin.
-  - Prefer this for pipes, redirects, here-docs, `$()`, `$VAR`, nested quotes,
-    and anything more complex than one line.
-  - Optional `distro` one-shot override.
 - `wsl_task`
-  - Manage async/watch tasks started by `wsl_exec` or `wsl_script`.
+  - Manage async/watch tasks started by `wsl_exec`.
 - `wsl_job`
   - Detached persistent jobs that survive MCP restarts; optional `distro` on start.
 - `wsl_help`
@@ -37,12 +34,12 @@ Common deletes under `/mnt` are blocked best-effort, not sandboxed. Delete Windo
 
 The WSL and SSH MCPs intentionally use the same execution pattern:
 
-- `wsl_exec` / `wsl_script` take `mode: "sync" | "async" | "watch"`.
+- `wsl_exec` takes `mode: "sync" | "async" | "watch"`.
 - `mode="sync"` waits for completion and returns command output.
 - `mode="async"` returns a task snapshot immediately.
 - `mode="watch"` waits up to `timeout_ms`; on timeout it follows `on_timeout`.
 - `on_timeout` is only for `watch`; use `"detach"` to keep running or `"kill"` to cancel.
-- `tail_chars` is only for `wsl_exec` / `wsl_script` watch output.
+- `tail_chars` is only for `wsl_exec` watch output.
 - Manage background work with `wsl_task`.
 
 Task parameter names intentionally match `ssh_task`:
@@ -51,7 +48,7 @@ Task parameter names intentionally match `ssh_task`:
 - `stdoutOffset` / `stderrOffset` for offset reads.
 - `tail_chars` for task output tailing.
 
-Use `wsl_exec` / `wsl_script` with `mode="async"` for attached background work.
+Use `wsl_exec` with `mode="async"` for attached background work.
 Use `wsl_job` when work must survive an MCP restart. Output is bounded and
 resumable; sync output is not repeated in structuredContent.
 

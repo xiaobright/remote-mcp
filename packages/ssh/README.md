@@ -10,13 +10,11 @@ escaping traps while keeping remote state predictable.
 ## Default Tools
 
 - `ssh_exec`
-  - Run a short command. Internally it is still sent through stdin.
-- `ssh_script`
-  - Run a multi-line remote shell script through stdin.
-  - Prefer this for pipes, redirects, here-docs, `$()`, `$VAR`, nested quotes,
-    and anything more complex than one line.
+  - Run a command or multi-line script. Content is always sent through stdin.
+  - Prefer it for pipes, redirects, here-docs, `$()`, `$VAR`, nested quotes; one
+    tool covers both a single line and a whole script. `shell` defaults to bash.
 - `ssh_task`
-  - Manage async/watch tasks started by `ssh_exec` or `ssh_script`.
+  - Manage async/watch tasks started by `ssh_exec`.
 - `ssh_job`
   - Detached jobs with remote disk logs; survive MCP restarts, not host reboot.
 - `ssh_help`
@@ -31,12 +29,12 @@ configuration, pagination, output compatibility and legacy limitations.
 
 The SSH and WSL MCPs intentionally use the same execution pattern:
 
-- `ssh_exec` / `ssh_script` take `mode: "sync" | "async" | "watch"`.
+- `ssh_exec` takes `mode: "sync" | "async" | "watch"`.
 - `mode="sync"` waits for completion and returns command output.
 - `mode="async"` returns a task snapshot immediately.
 - `mode="watch"` waits up to `timeout_ms`; on timeout it follows `on_timeout`.
 - `on_timeout` is only for `watch`; use `"detach"` to keep running or `"kill"` to cancel.
-- `tail_chars` is only for `ssh_exec` / `ssh_script` watch output.
+- `tail_chars` is only for `ssh_exec` watch output.
 - Manage background work with `ssh_task`.
 
 Task parameter names intentionally match `wsl_task`:
@@ -45,7 +43,7 @@ Task parameter names intentionally match `wsl_task`:
 - `stdoutOffset` / `stderrOffset` for offset reads.
 - `tail_chars` for task output tailing.
 
-Use `ssh_exec` / `ssh_script` with `mode="async"` for background work.
+Use `ssh_exec` with `mode="async"` for background work.
 
 Prefer `mode="sync"` for normal commands and long builds/tests when there is no
 other foreground work to do. Use `mode="async"` only when true background
@@ -93,7 +91,7 @@ Example profile:
 ```
 
 Then tool calls can use `target="devbox"` instead of `alice@devbox.local`. When a
-device has multiple hosts, `ssh_profile test`, `ssh_exec`, and `ssh_script` try
+device has multiple hosts, `ssh_profile test` and `ssh_exec` try
 the remembered last successful target first, then saved target/host/hosts. A
 successful connection updates `lastResolvedTarget` and `lastSeen`.
 
